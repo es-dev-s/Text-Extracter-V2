@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import re
@@ -14,7 +15,6 @@ from ..config import GROQ_CHAT_URL, groq_api_key, groq_enabled, groq_model
 from .headings import (
     TitleBand,
     canonical_header_key,
-    is_front_matter_page,
     is_known_heading,
     is_plausible_title,
     join_title_lines,
@@ -27,14 +27,17 @@ logger = logging.getLogger("engine.groq")
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 _INDEX_PREFIX_RE = re.compile(r"^\s*\d+[.)]\s+")
-EXCERPT_LIMIT = 500
+EXCERPT_LIMIT = 1000
+_WRAP_TAILS = {
+    "and", "or", "of", "for", "the", "a", "an", "to", "with", "in", "on",
+    "by", "from", "into", "using", "via", "at", "as", "over", "under",
+}
 
 
 def opening_excerpt(pages: Sequence[PageExtract], limit: int = EXCERPT_LIMIT) -> str:
-    """~500 characters from the first article page; fill from the next page if needed."""
-    usable = [page for page in pages if not is_front_matter_page(page)][:2] or list(pages[:2])
+    """Up to `limit` characters: page 1, then 2, then 3, until the budget is filled."""
     parts: list[str] = []
-    for page in usable:
+    for page in pages:
         text = re.sub(r"\s+", " ", page.text or "").strip()
         if not text:
             continue
@@ -45,9 +48,17 @@ def opening_excerpt(pages: Sequence[PageExtract], limit: int = EXCERPT_LIMIT) ->
     if len(blob) <= limit:
         return blob
     cut = blob[:limit]
-    if len(blob) > limit and blob[limit].isalnum() and cut[-1:].isalnum():
+    if blob[limit].isalnum() and cut[-1:].isalnum():
         cut = cut.rsplit(" ", 1)[0]
     return cut.strip()
+
+
+def _is_incomplete_title(text: str) -> bool:
+    t = freeze_title(text)
+    if not t or not is_plausible_title(t):
+        return True
+    last = t.split()[-1].lower().strip("-,:")
+    return last in _WRAP_TAILS
 
 
 def _parse_json_object(raw: str) -> Optional[dict]:
@@ -144,8 +155,13 @@ def _candidate_pool(
     return pool
 
 
+def freeze_title(text: str) -> str:
+    """Canonical string so the same PDF always yields the same title bytes."""
+    return strip_title_affixes(strip_section_tails(_strip_index(normalize(text or ""))))
+
+
 def complete_from_list(chosen: str, pool: Sequence[str]) -> Optional[str]:
-    """If the model returned a half title that exists in full on the list, use the full item."""
+    """If a half title exists in full on the list, use the full item."""
     picked = strip_section_tails(_strip_index(chosen))
     if not picked:
         return None
@@ -164,13 +180,16 @@ def complete_from_list(chosen: str, pool: Sequence[str]) -> Optional[str]:
 
 def _best_plausible(text: str, pool: Sequence[str]) -> Optional[str]:
     ordered: list[str] = []
-    for candidate in (text, strip_title_affixes(text), complete_from_list(text, pool)):
+    longer = complete_from_list(text, pool)
+    if longer:
+        ordered.append(longer)
+    for candidate in (text, strip_title_affixes(text)):
         if candidate:
             ordered.append(candidate)
     ordered.extend(pool)
     seen: set[str] = set()
     for candidate in ordered:
-        cleaned = strip_title_affixes(strip_section_tails(_strip_index(candidate)))
+        cleaned = freeze_title(candidate)
         key = canonical_header_key(cleaned)
         if not key or key in seen:
             continue
@@ -195,6 +214,46 @@ def grounded_in_sources(chosen: str, *sources: str) -> bool:
     return True
 
 
+def _accept_ai_title(
+    native: str,
+    chosen: str,
+    pool: Sequence[str],
+    sources: Sequence[str],
+) -> Optional[str]:
+    """Keep native when it is already complete; allow AI only to confirm or fill a half title."""
+    native_f = freeze_title(native)
+    chosen_f = freeze_title(chosen)
+    if not chosen_f:
+        return None
+
+    recovered = chosen_f
+    for source in sources:
+        found = recover_span(chosen_f, source)
+        if found:
+            recovered = found
+            break
+    completed = freeze_title(complete_from_list(recovered, pool) or recovered)
+    if not completed or not is_plausible_title(completed):
+        return None
+    if not grounded_in_sources(completed, *sources):
+        return None
+
+    native_key = canonical_header_key(native_f)
+    chosen_key = canonical_header_key(completed)
+    native_incomplete = _is_incomplete_title(native_f)
+
+    if not native_incomplete and is_plausible_title(native_f):
+        if chosen_key == native_key:
+            return native_f
+        if native_key and chosen_key.startswith(native_key + " "):
+            return completed
+        return None
+
+    if native_key and (chosen_key == native_key or chosen_key.startswith(native_key + " ")):
+        return completed
+    return completed
+
+
 def _build_messages(
     *,
     filename: str,
@@ -213,31 +272,33 @@ def _build_messages(
         {
             "role": "system",
             "content": (
-                "You extract the official title of an engineering assignment or "
-                "CDR (Competency Demonstration Report) submission. "
-                "Return the complete title exactly as printed — never a half line. "
-                "If the full title is already in the numbered list, copy that one list "
-                "item exactly. If the printed title wraps across title-band lines, join "
-                "only those consecutive band lines. "
-                "Use only words that appear in the list, title-band, or opening excerpt. "
-                "Do not invent words. Never append Abstract, Keywords, Introduction, "
-                "References, author names, or university names to the title. "
-                "Never include authors, URLs, journal names, Accepted Manuscript, "
-                "university names, or campus addresses. "
-                "JSON only."
+                "You verify the official printed title of an engineering assignment "
+                "or CDR (Competency Demonstration Report) PDF. "
+                "The native title is a layout validation already extracted from the PDF. "
+                "The text block is up to 1000 characters copied from the PDF "
+                "(page 1, then page 2, then page 3, until 1000 characters). "
+                "Return the complete title exactly as printed. "
+                "If the native title is already the full printed title, copy it EXACTLY "
+                "— same words and spelling; do not shorten or replace it. "
+                "If the native title is half (cuts off, ends with and/of/for/the, or is "
+                "cover chrome such as Accepted Manuscript), complete or correct it using "
+                "ONLY words that appear in the native title, title-band, header list, or "
+                "the text block. Never invent words. Never add authors, emails, URLs, "
+                "journal names, university names, campus addresses, Abstract, Keywords, "
+                "Introduction, or References. JSON only."
             ),
         },
         {
             "role": "user",
             "content": (
-                f"Filename: {filename}\n"
-                f"Heuristic title (may be truncated): {heuristic_title}\n\n"
+                f"Filename: {filename}\n\n"
+                f"NATIVE TITLE (layout validation I found):\n{heuristic_title}\n\n"
                 f"Detected headers / title list:\n{listed}\n\n"
                 f"Title-band lines (large text at the top):\n{band_lines}\n\n"
-                f"Opening excerpt (~500 characters from page 1, then page 2 if needed):\n"
+                f"TEXT BLOCK (up to 1000 characters from the PDF, page 1 then 2 then 3…):\n"
                 f"{excerpt}\n\n"
                 "Return JSON: "
-                '{"title": "<full exact assignment title>"}'
+                '{"title": "<full exact printed title>"}'
             ),
         },
     ]
@@ -284,6 +345,67 @@ async def _groq_content(http: httpx.AsyncClient, payload: dict) -> Optional[str]
     return None
 
 
+async def pick_title_from_page_image(
+    http: httpx.AsyncClient,
+    *,
+    jpeg: bytes,
+    filename: str,
+    native_title: str = "",
+    excerpt: str = "",
+) -> Optional[str]:
+    """Read the printed title from a small page-1 JPEG. Used only when text OCR failed."""
+    if not jpeg or not groq_enabled() or len(jpeg) > 900_000:
+        return None
+    data_url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
+    safe_excerpt = re.sub(r"[^\x20-\x7E]+", " ", excerpt or "")
+    safe_excerpt = re.sub(r"\s+", " ", safe_excerpt).strip()[:400]
+    native_guess = native_title if native_title and native_title.lower() not in {
+        "untitled document", "untitled", "no ocr",
+    } else "(none)"
+    payload = {
+        "model": groq_model(),
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "Read the official printed document title from the top of this first page. "
+                    "Return that title exactly as printed. Do not add authors, emails, journal "
+                    "names, Abstract, or Keywords. JSON only."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Filename: {filename}\n"
+                            f"Native title guess (may be wrong): {native_guess}\n"
+                            f"Opening text (may be garbled): {safe_excerpt or '(none)'}\n"
+                            'Return JSON: {"title": "<full exact printed title>"}'
+                        ),
+                    },
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        "temperature": 0.0,
+        "top_p": 1e-9,
+        "seed": 0,
+        "max_completion_tokens": 180,
+        "reasoning_effort": "none",
+        "response_format": {"type": "json_object"},
+    }
+    content = await _groq_content(http, payload)
+    if not content:
+        return None
+    data = _parse_json_object(content) or {}
+    chosen = freeze_title(str(data.get("title") or ""))
+    if not chosen or not is_plausible_title(chosen):
+        return None
+    return chosen
+
+
 async def pick_pdf_title(
     http: httpx.AsyncClient,
     *,
@@ -294,51 +416,51 @@ async def pick_pdf_title(
     excerpt: str = "",
 ) -> tuple[str, str]:
     header_list = [_strip_index(h) for h in (headers or []) if h]
-    fallback = strip_title_affixes(band.text or heuristic_title)
+    fallback = freeze_title(band.text or heuristic_title)
     pool = _candidate_pool(band, header_list)
-    sources = excerpt, " ".join(header_list), join_title_lines(band.lines) if band.lines else ""
+    locked = _best_plausible(fallback, pool) or fallback
+    sources = (
+        excerpt,
+        " ".join(header_list),
+        join_title_lines(band.lines) if band.lines else "",
+        fallback,
+    )
 
     if not groq_enabled():
-        return _best_plausible(fallback, pool) or fallback, "heuristic"
+        return locked, "heuristic"
 
     payload = {
         "model": groq_model(),
         "messages": _build_messages(
             filename=filename or "document.pdf",
-            heuristic_title=fallback,
+            heuristic_title=locked or fallback,
             band=band,
             headers=header_list,
             excerpt=excerpt,
         ),
         "temperature": 0.0,
+        "top_p": 1e-9,
+        "seed": 0,
         "max_completion_tokens": 220,
         "reasoning_effort": "none",
         "response_format": {"type": "json_object"},
     }
     content = await _groq_content(http, payload)
     if not content:
-        return _best_plausible(fallback, pool) or fallback, "heuristic"
+        return locked, "heuristic"
 
     data = _parse_json_object(content) or {}
-    chosen = strip_title_affixes(strip_section_tails(_strip_index(str(data.get("title") or ""))))
+    chosen = freeze_title(str(data.get("title") or ""))
     if not chosen:
         start, end = data.get("start"), data.get("end")
         try:
             start_i, end_i = int(start), int(end)
             if band.lines and 1 <= start_i <= end_i <= len(band.lines):
-                chosen = join_title_lines(band.lines[start_i - 1 : end_i])
+                chosen = freeze_title(join_title_lines(band.lines[start_i - 1 : end_i]))
         except (TypeError, ValueError):
             chosen = ""
 
-    if chosen:
-        completed = complete_from_list(chosen, pool) or chosen
-        picked = _best_plausible(completed, pool)
-        if picked:
-            return picked, "groq"
-        recovered = recover_span(chosen, excerpt) or recover_span(chosen, " ".join(header_list))
-        if recovered and grounded_in_sources(recovered, *sources):
-            picked = _best_plausible(recovered, pool)
-            if picked:
-                return picked, "groq"
-
-    return _best_plausible(fallback, pool) or fallback, "heuristic"
+    accepted = _accept_ai_title(locked, chosen, pool, sources) if chosen else None
+    if accepted:
+        return accepted, "groq"
+    return locked, "heuristic"

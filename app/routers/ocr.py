@@ -8,6 +8,7 @@ from .. import __version__
 from ..config import get_settings, groq_enabled, groq_model
 from ..files import read_upload, safe_filename
 from ..schemas import EngineStatus, ExtractResponse
+from ..services.ocr import ocr_backend
 from ..services.pipeline import EncryptedPdfError, NativePdfError, extract_document
 
 router = APIRouter()
@@ -21,6 +22,7 @@ async def engine_status() -> EngineStatus:
         version=__version__,
         groq_model=groq_model() if enabled else None,
         groq_title_verify=enabled,
+        ocr=ocr_backend(),
         max_upload_mb=settings.max_upload_mb,
         max_pages=settings.max_pages,
     )

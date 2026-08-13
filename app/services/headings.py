@@ -25,6 +25,10 @@ VISUAL_MIN_SCORE = 1.15
 MIN_SCAN_PAGE_WORDS = 80
 MERGE_GAP_RATIO = 2.2
 TITLE_BAND_MAX_LINES = 5
+_WRAP_TAIL_WORDS = {
+    "and", "or", "of", "for", "the", "a", "an", "to", "with", "in", "on",
+    "by", "from", "into", "using", "via", "at", "as", "over", "under",
+}
 
 _GENERIC_TITLES = {
     "untitled", "untitled document", "untitled 1", "document", "document1",
@@ -259,7 +263,9 @@ def looks_like_author_line(text: str) -> bool:
 def _looks_like_person_name(text: str) -> bool:
     if re.search(
         r"\b(design|analysis|investigation|experimental|cfd|optimization|"
-        r"fabrication|study|performance|machine|engine|heat|flow)\b",
+        r"fabrication|study|performance|machine|engine|heat|flow|"
+        r"wind|turbine|blade|speeds?|moderate|light|portable|movable|"
+        r"mixer|cutter|planter|concrete|refrigerat|lubricant|machining)\b",
         text,
         re.IGNORECASE,
     ):
@@ -352,7 +358,11 @@ def is_plausible_title(text: str) -> bool:
     if _URL_EMAIL_RE.match(t) or is_caption(t) or is_known_heading(t):
         return False
     words = [w for w in re.split(r"[\s/_\-—–|:·•]+", t) if re.search(r"[A-Za-z]", w)]
-    return len(words) >= 3
+    if len(words) < 3:
+        return False
+    if words[-1].lower().strip("-,:") in _WRAP_TAIL_WORDS:
+        return False
+    return True
 
 
 def quoted_cover_title(page: PageExtract) -> Optional[str]:
@@ -642,15 +652,44 @@ def join_title_lines(lines: Sequence[Line]) -> str:
     return text
 
 
-def _is_title_stop(ln: Line) -> bool:
+def _ends_with_wrap(text: str) -> bool:
+    words = normalize(text).split()
+    if not words:
+        return False
+    return words[-1].lower().strip("-,:") in _WRAP_TAIL_WORDS
+
+
+def _strong_author_marks(text: str) -> bool:
+    t = normalize(text)
+    if not t:
+        return False
+    if t.count("#") >= 1 or t.count("*") >= 2:
+        return True
+    if _AUTHOR_MARK_RE.search(t) or _NUMBERED_PERSON_RE.search(t):
+        return True
+    if "@" in t:
+        return True
+    return False
+
+
+def _is_rule_line(text: str) -> bool:
+    t = normalize(text)
+    return bool(t) and not re.search(r"[A-Za-z0-9]", t)
+
+
+def _is_title_stop(ln: Line, prev: Optional[Line] = None) -> bool:
     text = normalize(ln.text)
     if not text:
+        return True
+    if _is_rule_line(text):
         return True
     if is_known_heading(text) or is_numbered_heading(text) or is_caption(text):
         return True
     if is_journal_label(text):
         return True
     if looks_like_author_line(text):
+        if prev is not None and _ends_with_wrap(prev.text) and not _strong_author_marks(text):
+            return False
         return True
     if text.count(",") >= 3 and _word_count(text) >= 6:
         return True
@@ -664,7 +703,7 @@ def _is_gap_skip(ln: Line, title_size: float, running: set[str]) -> bool:
     if ln.size + 0.35 < title_size * 0.70:
         return True
     text = normalize(ln.text)
-    if not text:
+    if not text or _is_rule_line(text):
         return True
     if is_cover_chrome(text) or is_journal_label(text) or _URL_EMAIL_RE.match(text):
         return True
@@ -674,7 +713,7 @@ def _is_gap_skip(ln: Line, title_size: float, running: set[str]) -> bool:
 
 
 def _same_wrap(prev: Line, nxt: Line, title_size: float) -> bool:
-    if _is_title_stop(nxt):
+    if _is_title_stop(nxt, prev=prev):
         return False
     gap = nxt.y0 - prev.y1
     if gap > max(title_size * 1.35, 16):
@@ -750,7 +789,7 @@ def extract_title_band(
         if j >= len(ordered):
             break
         cand = ordered[j]
-        if is_noise_line(cand, running) or _is_title_stop(cand):
+        if is_noise_line(cand, running) or _is_title_stop(cand, prev=band_lines[-1]):
             break
         if not _same_wrap(band_lines[-1], cand, title_size):
             break
