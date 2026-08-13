@@ -50,6 +50,8 @@ _KNOWN_HEADINGS = {
 _JOURNAL_LABELS = {
     "research article", "original article", "review article", "short communication",
     "technical note", "case study", "conference paper", "full length article",
+    "research paper", "accepted manuscript", "conference series", "paper open access",
+    "editorial board", "aims and scope", "table of contents", "you may also like",
 }
 
 _MONTHS = (
@@ -110,14 +112,58 @@ _NUMBERED_HEADING_RE = re.compile(
 )
 _METADATA_LABEL_RE = re.compile(
     r"^(keywords?|corresponding author|doi|received|accepted|published|"
-    r"available online|e-?mail)\s*:",
+    r"available online(?:\s+at)?|e-?mail|pii|to appear in|received date|"
+    r"revised date|accepted date)\s*:",
     re.IGNORECASE,
 )
 _AUTHOR_RE = re.compile(
-    r"\b(prof\.|dr\.|ph\.?d|university|college of|corresponding author|"
-    r"e-?mail|copyright\s*©)\b",
+    r"\b(?:prof|dr|ph\.?d|engr|university|college of|corresponding author|"
+    r"e-?mail|copyright|internal editor|editor-in-chief)\b",
     re.IGNORECASE,
 )
+_AUTHOR_MARK_RE = re.compile(r"\*\s*\d+\b")
+_NUMBERED_PERSON_RE = re.compile(r"(?:^|\s)\d+[A-Z][a-z]{2,}")
+_NAME_NUM_COMMA_RE = re.compile(
+    r"[A-Za-z][A-Za-z.'\-]*\d+\s*,\s*[A-Z]"
+)
+_JOURNAL_BANNER_RE = re.compile(
+    r"^(?:(?:international|iosr|open access)\s+)?(?:research\s+)?journal of\b",
+    re.IGNORECASE,
+)
+_COVER_CHROME_RE = re.compile(
+    r"^(?:"
+    r"a project report(?:\s+on)?"
+    r"|submitted (?:by|in|to)\b.*"
+    r"|in partial fulfillment\b.*"
+    r"|bachelors? of engineering\b.*"
+    r"|department of .+"
+    r"|associate professor\b.*"
+    r"|under the guidance of\b.*"
+    r"|carried out at\b.*"
+    r"|certificate"
+    r"|declaration"
+    r"|to cite this article\b.*"
+    r"|view the article online\b.*"
+    r"|paper\s*[•·]?\s*open access"
+    r"|you may also like"
+    r"|please cite this article\b.*"
+    r")$",
+    re.IGNORECASE,
+)
+_ADDRESS_RE = re.compile(
+    r"(?:\b\d{6}\b"
+    r"|[A-Za-z]+,\s+[A-Za-z]+\s+\d{5}(?:-\d{4})?\b"
+    r"|,\s*(?:belagavi|bengaluru|bangalore|chennai|mumbai|delhi)\b"
+    r"|\b(?:layout|campus|nagar)\b)",
+    re.IGNORECASE,
+)
+_QUOTED_TITLE_RE = re.compile(r"[“\"']\s*([^“\"']{8,200}?)\s*[”\"']")
+_FRONT_MATTER_MARKERS = (
+    "editorial board", "table of contents", "aims and scope",
+    "a journal produced by", "guide for authors",
+    "internal editor", "editor-in-chief", "cover page design",
+)
+ARTIFACT_FONT_SIZE = 40.0
 _PAREN_LABEL_RE = re.compile(r"^\([^)]{3,40}\)$")
 _YEAR_TAIL_RE = re.compile(r",?\s*(?:19|20)\d{2}$")
 
@@ -173,6 +219,171 @@ def is_weak_title(text: str) -> bool:
     return False
 
 
+def is_garbled_text(text: str) -> bool:
+    """True when PDF text is a custom-font / CID dump, not readable English."""
+    raw = text or ""
+    if not raw.strip():
+        return False
+    letters = [c for c in raw if c.isalpha()]
+    if letters:
+        latin = sum(1 for c in letters if "A" <= c <= "Z" or "a" <= c <= "z")
+        if latin / len(letters) < 0.55:
+            return True
+    bad = sum(1 for c in raw if ord(c) < 32 or 0xE000 <= ord(c) <= 0xF8FF)
+    if len(raw) >= 6 and bad / len(raw) >= 0.25:
+        return True
+    return False
+
+
+def looks_like_author_line(text: str) -> bool:
+    t = normalize(text)
+    if not t or is_numbered_heading(t) or is_known_heading(t):
+        return False
+    if _AUTHOR_MARK_RE.search(t) or _NUMBERED_PERSON_RE.search(t) or _NAME_NUM_COMMA_RE.search(t):
+        return True
+    if t.lstrip().startswith("*") and _word_count(t) <= 10:
+        return True
+    if re.search(r"\b(students?|lecturers?)\b", t, re.IGNORECASE) and _word_count(t) <= 8:
+        return True
+    if t.count("*") >= 2 or t.count("#") >= 2:
+        return True
+    if _AUTHOR_RE.search(t):
+        return True
+    if re.search(r"\bdepartment\b.*\b(?:institute|university|college)\b", t, re.IGNORECASE):
+        return True
+    if _looks_like_person_name(t):
+        return True
+    return False
+
+
+def _looks_like_person_name(text: str) -> bool:
+    if re.search(
+        r"\b(design|analysis|investigation|experimental|cfd|optimization|"
+        r"fabrication|study|performance|machine|engine|heat|flow)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return False
+    words = [w.strip(",.;") for w in text.replace("&", " ").split() if w.strip(",.;")]
+    if not (2 <= len(words) <= 5):
+        return False
+    name_tok = re.compile(r"^[A-Z][a-z]+(?:[.'\-]?[A-Za-z]+)*$|^[A-Z]\.$")
+    return all(name_tok.match(w) for w in words)
+
+
+def is_cover_chrome(text: str) -> bool:
+    t = normalize(text)
+    if not t:
+        return False
+    key = running_header_key(t)
+    if key in _JOURNAL_LABELS:
+        return True
+    if _COVER_CHROME_RE.match(t):
+        return True
+    if _ADDRESS_RE.search(t) and _word_count(t) <= 10:
+        return True
+    if re.search(r"\b(technological university|institute of technology)\b", t, re.IGNORECASE):
+        return True
+    if _JOURNAL_BANNER_RE.match(t) and _word_count(t) <= 16:
+        return True
+    if re.match(r"^proceedings of\b", t, re.IGNORECASE):
+        return True
+    if "www." in t.lower() and _word_count(t) <= 16:
+        return True
+    if t.isupper() and t in {
+        "TECHNOLOGY", "SCIENCES", "RESEARCH", "LETTERS", "PROCEEDINGS",
+        "TRANSACTIONS", "ARCHIVE", "ARCHIVES",
+    }:
+        return True
+    if re.fullmatch(
+        r"(?:the\s+)?(?:international\s+journal\s+of\s+)?(?:mechanical\s+)?"
+        r"engineering(?:\s+and\s+(?:sciences|technology))?",
+        t,
+        re.IGNORECASE,
+    ):
+        return True
+    words = t.split()
+    if len(words) >= 3 and all(len(w) == 1 and w.isalpha() for w in words):
+        return True
+    return False
+
+
+def is_font_artifact(ln: Line) -> bool:
+    return ln.size >= ARTIFACT_FONT_SIZE
+
+
+def strip_title_affixes(text: str) -> str:
+    """Drop URL prefixes and trailing author lists from an otherwise-good title."""
+    t = normalize(text)
+    t = re.sub(r"^(?:https?://\S+|www\.\S+)\s+", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^available online(?:\s+at)?:\s+\S+\s+", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"^(?:title|subject)\s*:\s*", "", t, flags=re.IGNORECASE)
+    cut = None
+    for rx in (_AUTHOR_MARK_RE, _NUMBERED_PERSON_RE, _NAME_NUM_COMMA_RE):
+        match = rx.search(t)
+        if match and match.start() >= 12:
+            start = match.start()
+            if cut is None or start < cut:
+                cut = start
+    if cut is not None:
+        t = t[:cut].strip(" ,;:-")
+    t = strip_toc_leader(t).strip(" \t-_:;,|·•“”\"'")
+    return t
+
+
+def is_plausible_title(text: str) -> bool:
+    t = strip_title_affixes(normalize(text))
+    if not t or is_garbled_text(t) or is_weak_title(t):
+        return False
+    if is_cover_chrome(t) or is_journal_label(t) or looks_like_author_line(t):
+        return False
+    if _ADDRESS_RE.search(t):
+        return False
+    if t[:1] in {"*", "#"} or t[:1].islower():
+        return False
+    if "@" in t or "http://" in t.lower() or "https://" in t.lower():
+        return False
+    if t.endswith((".", "?", "!")) and _word_count(t) >= 12:
+        return False
+    if re.search(r"\.\s+[A-Z]", t) and _word_count(t) >= 10:
+        return False
+    if re.search(r"\b(?:journal of physics|open access proceedings)\b", t, re.IGNORECASE):
+        return False
+    if _URL_EMAIL_RE.match(t) or is_caption(t) or is_known_heading(t):
+        return False
+    words = [w for w in re.split(r"[\s/_\-—–|:·•]+", t) if re.search(r"[A-Za-z]", w)]
+    return len(words) >= 3
+
+
+def quoted_cover_title(page: PageExtract) -> Optional[str]:
+    blob = (page.text or "")[:1200].lower()
+    if not any(
+        marker in blob
+        for marker in (
+            "project report", "submitted in partial", "submitted by",
+            "in partial fulfillment", "visvesvaraya",
+        )
+    ):
+        return None
+    for ln in page.lines:
+        match = _QUOTED_TITLE_RE.search(ln.text or "")
+        if not match:
+            continue
+        t = clean_candidate(match.group(1), allow_weak=False)
+        if t and is_plausible_title(t):
+            return t
+    return None
+
+
+def is_front_matter_page(page: PageExtract) -> bool:
+    blob = canonical_header_key((page.text or "")[:1400])
+    if any(marker in blob for marker in _FRONT_MATTER_MARKERS):
+        return True
+    if page.char_count < 420 and "journal" in blob:
+        return True
+    return False
+
+
 def clean_candidate(text: Optional[str], *, allow_weak: bool = False, max_len: int = MAX_TITLE_LEN) -> Optional[str]:
     if not text:
         return None
@@ -197,6 +408,8 @@ def clean_candidate(text: Optional[str], *, allow_weak: bool = False, max_len: i
     if _DATE_RE.match(t) or _PAGE_NO_RE.match(t) or _URL_EMAIL_RE.match(t):
         return None
     if is_date_like(t):
+        return None
+    if is_garbled_text(t) or looks_like_author_line(t) or is_cover_chrome(t):
         return None
     if not allow_weak and is_weak_title(t):
         return None
@@ -265,7 +478,7 @@ def is_author_or_footnote(ln: Line) -> bool:
     text = normalize(ln.text)
     if is_numbered_heading(text) or is_known_heading(text):
         return False
-    if _AUTHOR_RE.search(text):
+    if looks_like_author_line(text):
         return True
     footer = ln.page_height > 0 and ln.y0 >= ln.page_height * 0.88
     if footer and ("corresponding" in text.lower() or "@" in text or "copyright" in text.lower()):
@@ -277,10 +490,12 @@ def is_noise_line(ln: Line, running: set[str]) -> bool:
     text = normalize(ln.text)
     if not text:
         return True
+    if is_garbled_text(text) or is_font_artifact(ln) or is_cover_chrome(text):
+        return True
     key = running_header_key(text)
     if key in running or canonical_header_key(text) in running:
         return True
-    if _PAGE_NO_RE.match(text) or is_date_like(text):
+    if _PAGE_NO_RE.match(text) or is_date_like(text) or _URL_EMAIL_RE.match(text):
         return True
     if is_caption(text) or is_journal_label(text) or is_author_or_footnote(ln):
         return True
@@ -415,7 +630,10 @@ def join_title_lines(lines: Sequence[Line]) -> str:
         if chunks:
             prev = chunks[-1]
             if prev.endswith("-") and re.search(r"[A-Za-z]$", prev[:-1]) and piece[:1].isalpha():
-                chunks[-1] = prev[:-1] + piece
+                if piece[:1].islower():
+                    chunks[-1] = prev[:-1] + piece
+                else:
+                    chunks[-1] = prev + piece
                 continue
         chunks.append(piece)
     text = normalize(" ".join(chunks)).strip(" \t-_:;")
@@ -432,9 +650,25 @@ def _is_title_stop(ln: Line) -> bool:
         return True
     if is_journal_label(text):
         return True
-    if _AUTHOR_RE.search(text):
+    if looks_like_author_line(text):
         return True
     if text.count(",") >= 3 and _word_count(text) >= 6:
+        return True
+    return False
+
+
+def _is_gap_skip(ln: Line, title_size: float, running: set[str]) -> bool:
+    """Sidebar / watermark / tiny type sitting between wrapped title lines."""
+    if is_font_artifact(ln) or is_garbled_text(ln.text):
+        return True
+    if ln.size + 0.35 < title_size * 0.70:
+        return True
+    text = normalize(ln.text)
+    if not text:
+        return True
+    if is_cover_chrome(text) or is_journal_label(text) or _URL_EMAIL_RE.match(text):
+        return True
+    if is_noise_line(ln, running) and not _is_title_stop(ln):
         return True
     return False
 
@@ -443,13 +677,13 @@ def _same_wrap(prev: Line, nxt: Line, title_size: float) -> bool:
     if _is_title_stop(nxt):
         return False
     gap = nxt.y0 - prev.y1
-    if gap > max(title_size * 0.95, 12):
+    if gap > max(title_size * 1.35, 16):
         return False
     if nxt.size + 0.4 < title_size * 0.88:
         return False
     prev_mid = (prev.x0 + prev.x1) / 2.0
     nxt_mid = (nxt.x0 + nxt.x1) / 2.0
-    aligned = abs(nxt.x0 - prev.x0) <= 36 or abs(nxt_mid - prev_mid) <= 48
+    aligned = abs(nxt.x0 - prev.x0) <= 48 or abs(nxt_mid - prev_mid) <= 64
     return aligned
 
 
@@ -468,7 +702,11 @@ def extract_title_band(
     top = [ln for ln in ordered if ln.y0 <= page_h * VISUAL_TOP_FRACTION]
     usable = [
         ln for ln in top
-        if not is_noise_line(ln, running) and not _is_title_stop(ln)
+        if not is_noise_line(ln, running)
+        and not _is_title_stop(ln)
+        and not is_weak_title(ln.text)
+        and not is_font_artifact(ln)
+        and not looks_like_sentence(ln.text)
     ]
     if not usable:
         return TitleBand(context=_title_context(ordered))
@@ -488,22 +726,41 @@ def extract_title_band(
     except ValueError:
         return TitleBand(context=_title_context(ordered))
 
-    start = idx
-    while start > 0 and _same_wrap(ordered[start - 1], ordered[start], title_size):
-        if is_noise_line(ordered[start - 1], running):
+    band_lines = [seed]
+    cursor = idx
+    while len(band_lines) < TITLE_BAND_MAX_LINES:
+        j = cursor - 1
+        while j >= 0 and _is_gap_skip(ordered[j], title_size, running):
+            j -= 1
+        if j < 0:
             break
-        start -= 1
-    end = idx
-    while end + 1 < len(ordered) and (end - start + 1) < TITLE_BAND_MAX_LINES:
-        nxt = ordered[end + 1]
-        if is_noise_line(nxt, running) or not _same_wrap(ordered[end], nxt, title_size):
+        cand = ordered[j]
+        if is_noise_line(cand, running) or _is_title_stop(cand):
             break
-        end += 1
+        if not _same_wrap(cand, band_lines[0], title_size):
+            break
+        band_lines.insert(0, cand)
+        cursor = j
 
-    band_lines = ordered[start : end + 1]
+    cursor = idx
+    while len(band_lines) < TITLE_BAND_MAX_LINES:
+        j = cursor + 1
+        while j < len(ordered) and _is_gap_skip(ordered[j], title_size, running):
+            j += 1
+        if j >= len(ordered):
+            break
+        cand = ordered[j]
+        if is_noise_line(cand, running) or _is_title_stop(cand):
+            break
+        if not _same_wrap(band_lines[-1], cand, title_size):
+            break
+        band_lines.append(cand)
+        cursor = j
+
+    joined = strip_title_affixes(join_title_lines(band_lines))
     return TitleBand(
         lines=band_lines,
-        text=join_title_lines(band_lines),
+        text=joined,
         context=_title_context(ordered, skip=set(id(ln) for ln in band_lines)),
     )
 
@@ -624,11 +881,17 @@ def filename_title(filename: Optional[str]) -> Optional[str]:
 
 def _select_scan_pages(pages: Sequence[PageExtract]) -> List[PageExtract]:
     selected: List[PageExtract] = []
+    skipped: List[PageExtract] = []
     for page in pages:
+        if not selected and is_front_matter_page(page):
+            skipped.append(page)
+            continue
         selected.append(page)
         if _word_count(page.text) >= MIN_SCAN_PAGE_WORDS:
             break
-    return selected
+    if selected:
+        return selected
+    return skipped[:1] or list(pages[:1])
 
 
 def resolve_document_title(
@@ -643,50 +906,38 @@ def resolve_document_title(
     running = _running_header_keys(pages)
     band = TitleBand()
     if scan:
-        band = extract_title_band(scan[0], body, running)
+        band = extract_title_band(scan[0], body, running=set())
 
     heading_hint = None
     if doc.toc:
         heading_hint = clean_candidate(doc.toc[0][1], allow_weak=True)
-        if heading_hint and (is_journal_label(heading_hint) or is_caption(heading_hint)):
+        if heading_hint and (is_journal_label(heading_hint) or is_caption(heading_hint) or not is_plausible_title(heading_hint)):
             heading_hint = None
 
-    if band.text and not is_weak_title(band.text):
-        return band.text, "visual", band
-    if band.text:
-        return band.text, "visual", band
+    quoted = quoted_cover_title(scan[0]) if scan else None
+    if quoted:
+        return quoted, "visual", band
 
-    if heading_hint and not is_weak_title(heading_hint) and not is_date_like(heading_hint):
-        for page in scan:
-            visual = visual_title(page, body, running)
-            if visual:
-                return visual, "visual", band
-        return heading_hint, "toc", band
+    cleaned_band = strip_title_affixes(band.text) if band.text else ""
+    if cleaned_band and is_plausible_title(cleaned_band):
+        band.text = cleaned_band
+        return cleaned_band, "visual", band
 
     for page in scan:
         visual = visual_title(page, body, running)
-        if visual:
+        if visual and is_plausible_title(visual):
             return visual, "visual", band
 
-    if heading_hint:
-        strong = first_content_line(scan or pages, running)
-        if strong:
-            return strong, "content", band
-        cleaned = clean_candidate(heading_hint)
-        if cleaned:
-            return cleaned, "toc", band
+    if heading_hint and is_plausible_title(heading_hint):
+        return heading_hint, "toc", band
 
     t = clean_candidate(doc.meta_title)
-    if t:
+    if t and is_plausible_title(t):
         return t, "metadata", band
 
-    t = first_content_line(pages, running)
-    if t:
+    t = first_content_line(scan or pages, running)
+    if t and is_plausible_title(t):
         return t, "content", band
-
-    t = filename_title(filename)
-    if t:
-        return t, "filename", band
 
     return "Untitled document", "none", band
 

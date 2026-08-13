@@ -14,9 +14,12 @@ from ..config import GROQ_CHAT_URL, groq_api_key, groq_enabled, groq_model
 from .headings import (
     TitleBand,
     canonical_header_key,
+    is_front_matter_page,
     is_known_heading,
+    is_plausible_title,
     join_title_lines,
     normalize,
+    strip_title_affixes,
 )
 from .native import PageExtract
 
@@ -28,9 +31,10 @@ EXCERPT_LIMIT = 500
 
 
 def opening_excerpt(pages: Sequence[PageExtract], limit: int = EXCERPT_LIMIT) -> str:
-    """~500 characters from page 1; fill from page 2 if page 1 is shorter."""
+    """~500 characters from the first article page; fill from the next page if needed."""
+    usable = [page for page in pages if not is_front_matter_page(page)][:2] or list(pages[:2])
     parts: list[str] = []
-    for page in pages[:2]:
+    for page in usable:
         text = re.sub(r"\s+", " ", page.text or "").strip()
         if not text:
             continue
@@ -120,8 +124,8 @@ def _candidate_pool(
     seen: set[str] = set()
 
     def add(text: str) -> None:
-        t = strip_section_tails(_strip_index(text))
-        if not t or is_known_heading(t):
+        t = strip_title_affixes(strip_section_tails(_strip_index(text)))
+        if not t or is_known_heading(t) or not is_plausible_title(t):
             return
         key = canonical_header_key(t)
         if not key or key in seen:
@@ -156,6 +160,24 @@ def complete_from_list(chosen: str, pool: Sequence[str]) -> Optional[str]:
             if longer is None or len(ck) > len(canonical_header_key(longer)):
                 longer = cand
     return longer or exact
+
+
+def _best_plausible(text: str, pool: Sequence[str]) -> Optional[str]:
+    ordered: list[str] = []
+    for candidate in (text, strip_title_affixes(text), complete_from_list(text, pool)):
+        if candidate:
+            ordered.append(candidate)
+    ordered.extend(pool)
+    seen: set[str] = set()
+    for candidate in ordered:
+        cleaned = strip_title_affixes(strip_section_tails(_strip_index(candidate)))
+        key = canonical_header_key(cleaned)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        if cleaned and is_plausible_title(cleaned):
+            return cleaned
+    return None
 
 
 def grounded_in_sources(chosen: str, *sources: str) -> bool:
@@ -200,6 +222,8 @@ def _build_messages(
                 "Use only words that appear in the list, title-band, or opening excerpt. "
                 "Do not invent words. Never append Abstract, Keywords, Introduction, "
                 "References, author names, or university names to the title. "
+                "Never include authors, URLs, journal names, Accepted Manuscript, "
+                "university names, or campus addresses. "
                 "JSON only."
             ),
         },
@@ -270,12 +294,12 @@ async def pick_pdf_title(
     excerpt: str = "",
 ) -> tuple[str, str]:
     header_list = [_strip_index(h) for h in (headers or []) if h]
-    fallback = band.text or heuristic_title
+    fallback = strip_title_affixes(band.text or heuristic_title)
     pool = _candidate_pool(band, header_list)
     sources = excerpt, " ".join(header_list), join_title_lines(band.lines) if band.lines else ""
 
     if not groq_enabled():
-        return complete_from_list(fallback, pool) or fallback, "heuristic"
+        return _best_plausible(fallback, pool) or fallback, "heuristic"
 
     payload = {
         "model": groq_model(),
@@ -293,10 +317,10 @@ async def pick_pdf_title(
     }
     content = await _groq_content(http, payload)
     if not content:
-        return complete_from_list(fallback, pool) or fallback, "heuristic"
+        return _best_plausible(fallback, pool) or fallback, "heuristic"
 
     data = _parse_json_object(content) or {}
-    chosen = strip_section_tails(_strip_index(str(data.get("title") or "")))
+    chosen = strip_title_affixes(strip_section_tails(_strip_index(str(data.get("title") or ""))))
     if not chosen:
         start, end = data.get("start"), data.get("end")
         try:
@@ -306,19 +330,15 @@ async def pick_pdf_title(
         except (TypeError, ValueError):
             chosen = ""
 
-    if not chosen:
-        return complete_from_list(fallback, pool) or fallback, "heuristic"
+    if chosen:
+        completed = complete_from_list(chosen, pool) or chosen
+        picked = _best_plausible(completed, pool)
+        if picked:
+            return picked, "groq"
+        recovered = recover_span(chosen, excerpt) or recover_span(chosen, " ".join(header_list))
+        if recovered and grounded_in_sources(recovered, *sources):
+            picked = _best_plausible(recovered, pool)
+            if picked:
+                return picked, "groq"
 
-    completed = complete_from_list(chosen, pool)
-    if completed:
-        return completed, "groq"
-
-    recovered = recover_span(chosen, excerpt) or recover_span(chosen, " ".join(header_list))
-    if recovered and grounded_in_sources(recovered, *sources):
-        upgraded = complete_from_list(recovered, pool)
-        return upgraded or recovered, "groq"
-
-    if grounded_in_sources(chosen, *sources):
-        return normalize(chosen), "groq"
-
-    return complete_from_list(fallback, pool) or fallback, "heuristic"
+    return _best_plausible(fallback, pool) or fallback, "heuristic"
