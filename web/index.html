@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF Title &amp; Headers</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <header class="top">
+      <p class="eyebrow">OCR-V2</p>
+      <h1>Extract title &amp; headers</h1>
+      <p class="lede">Drop a PDF. Native text is read first; Groq Qwen picks one document title from the header list.</p>
+    </header>
+
+    <section id="drop" class="drop" tabindex="0">
+      <input id="file" type="file" accept="application/pdf,.pdf" hidden />
+      <div class="drop-inner">
+        <strong>Drop a PDF here</strong>
+        <span>or click to choose a file</span>
+      </div>
+    </section>
+
+    <p id="status" class="status" hidden></p>
+
+    <section id="result" class="result" hidden>
+      <article class="title-card">
+        <p class="kicker"><span id="source-badge">AI title</span> · <span id="meta"></span></p>
+        <h2 id="title"></h2>
+      </article>
+      <ol id="headers" class="headers"></ol>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>
