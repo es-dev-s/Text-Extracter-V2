@@ -3,22 +3,26 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PDF Title &amp; Headers</title>
+  <meta name="description" content="OCR-V2 Engine — native PDF title and header extraction." />
+  <title>OCR-V2 Engine</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <main class="shell">
     <header class="top">
-      <p class="eyebrow">OCR-V2</p>
+      <p class="eyebrow">OCR-V2 Engine</p>
       <h1>Extract title &amp; headers</h1>
-      <p class="lede">Drop a PDF. Native text is read first; Groq Qwen picks one document title from the header list.</p>
+      <p class="lede">
+        Drop a PDF. Native text is read first; Groq Qwen picks one document title
+        from the header list. Same JSON API a Next.js app can call later.
+      </p>
     </header>
 
-    <section id="drop" class="drop" tabindex="0">
+    <section id="drop" class="drop" tabindex="0" role="button" aria-label="Upload a PDF">
       <input id="file" type="file" accept="application/pdf,.pdf" hidden />
       <div class="drop-inner">
         <strong>Drop a PDF here</strong>
-        <span>or click to choose a file</span>
+        <span>or click to choose a file · PDF only</span>
       </div>
     </section>
 
@@ -31,6 +35,14 @@
       </article>
       <ol id="headers" class="headers"></ol>
     </section>
+
+    <footer class="foot">
+      <a href="/docs">API docs</a>
+      <span aria-hidden="true">·</span>
+      <a href="/health">Health</a>
+      <span aria-hidden="true">·</span>
+      <a href="/v1/engine/status">Engine status</a>
+    </footer>
   </main>
   <script src="app.js"></script>
 </body>

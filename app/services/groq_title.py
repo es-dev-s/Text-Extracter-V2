@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import re
 from typing import Iterable, Optional, Sequence
 
@@ -17,6 +19,8 @@ from .headings import (
     normalize,
 )
 from .native import PageExtract
+
+logger = logging.getLogger("engine.groq")
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 _INDEX_PREFIX_RE = re.compile(r"^\s*\d+[.)]\s+")
@@ -215,6 +219,47 @@ def _build_messages(
     ]
 
 
+async def _groq_content(http: httpx.AsyncClient, payload: dict) -> Optional[str]:
+    headers = {
+        "Authorization": f"Bearer {groq_api_key()}",
+        "Content-Type": "application/json",
+    }
+    last_status: Optional[int] = None
+    for attempt in range(2):
+        try:
+            response = await http.post(GROQ_CHAT_URL, headers=headers, json=payload)
+        except httpx.TimeoutException:
+            logger.warning("Groq request timed out")
+            return None
+        except httpx.RequestError:
+            logger.warning("Groq request failed")
+            return None
+        last_status = response.status_code
+        if response.status_code == 429 and attempt == 0:
+            raw = response.headers.get("retry-after") or "1.5"
+            try:
+                delay = min(max(float(raw), 0.5), 4.0)
+            except ValueError:
+                delay = 1.5
+            logger.warning("Groq rate limited; retrying in %.1fs", delay)
+            await asyncio.sleep(delay)
+            continue
+        if response.status_code >= 400:
+            logger.warning("Groq HTTP %s", response.status_code)
+            return None
+        try:
+            body = response.json()
+        except ValueError:
+            logger.warning("Groq returned non-JSON")
+            return None
+        return (
+            ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
+            or ""
+        )
+    logger.warning("Groq HTTP %s", last_status)
+    return None
+
+
 async def pick_pdf_title(
     http: httpx.AsyncClient,
     *,
@@ -246,22 +291,8 @@ async def pick_pdf_title(
         "reasoning_effort": "none",
         "response_format": {"type": "json_object"},
     }
-    try:
-        response = await http.post(
-            GROQ_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {groq_api_key()}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-        response.raise_for_status()
-        body = response.json()
-        content = (
-            ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
-            or ""
-        )
-    except Exception:
+    content = await _groq_content(http, payload)
+    if not content:
         return complete_from_list(fallback, pool) or fallback, "heuristic"
 
     data = _parse_json_object(content) or {}

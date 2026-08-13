@@ -155,7 +155,9 @@ def _extract_page(page, page_no: int) -> PageExtract:
             plain = tp.extractText() or ""
             data = tp.extractDICT() or {}
     finally:
-        tp = None
+        close = getattr(tp, "close", None)
+        if callable(close):
+            close()
 
     lines: List[Line] = []
     for block in data.get("blocks", []):
@@ -187,7 +189,7 @@ def _extract_page(page, page_no: int) -> PageExtract:
     )
 
 
-def extract_pdf(data: bytes) -> NativeDocument:
+def extract_pdf(data: bytes, *, max_pages: Optional[int] = None) -> NativeDocument:
     if not data:
         raise NativePdfError("Empty file")
     if not data.lstrip().startswith(b"%PDF-"):
@@ -195,23 +197,32 @@ def extract_pdf(data: bytes) -> NativeDocument:
 
     try:
         doc = fitz.open(stream=data, filetype="pdf")
-    except Exception as exc:
-        raise NativePdfError(f"Cannot open PDF: {exc}") from exc
+    except Exception:
+        raise NativePdfError("Cannot open PDF") from None
 
     try:
         if doc.needs_pass:
             raise EncryptedPdfError("PDF is password-protected")
-        if doc.is_encrypted and doc.needs_pass:
-            raise EncryptedPdfError("PDF is password-protected")
+
+        if max_pages is not None and doc.page_count > max_pages:
+            raise NativePdfError(f"PDF exceeds {max_pages} page limit")
 
         meta = doc.metadata or {}
         meta_title = (meta.get("title") or "").strip() or None
         try:
-            toc = [(int(lvl), str(title).strip(), int(page)) for lvl, title, page in (doc.get_toc() or []) if str(title).strip()]
+            toc = [
+                (int(lvl), str(title).strip(), int(page))
+                for lvl, title, page in (doc.get_toc() or [])
+                if str(title).strip()
+            ]
         except Exception:
             toc = []
 
         pages = [_extract_page(page, i + 1) for i, page in enumerate(doc)]
+    except (EncryptedPdfError, NativePdfError):
+        raise
+    except Exception:
+        raise NativePdfError("Cannot read PDF") from None
     finally:
         doc.close()
 

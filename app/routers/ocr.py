@@ -2,28 +2,27 @@
 
 from __future__ import annotations
 
-import os
-
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
 from .. import __version__
-from ..config import groq_enabled, groq_model
+from ..config import get_settings, groq_enabled, groq_model
+from ..files import read_upload, safe_filename
 from ..schemas import EngineStatus, ExtractResponse
 from ..services.pipeline import EncryptedPdfError, NativePdfError, extract_document
 
 router = APIRouter()
 
-_MAX_UPLOAD_MB = float(os.environ.get("OCR_MAX_UPLOAD_MB", "50"))
-_MAX_BYTES = int(_MAX_UPLOAD_MB * 1024 * 1024)
-
 
 @router.get("/engine/status", response_model=EngineStatus)
 async def engine_status() -> EngineStatus:
+    settings = get_settings()
     enabled = groq_enabled()
     return EngineStatus(
         version=__version__,
         groq_model=groq_model() if enabled else None,
         groq_title_verify=enabled,
+        max_upload_mb=settings.max_upload_mb,
+        max_pages=settings.max_pages,
     )
 
 
@@ -33,21 +32,20 @@ async def extract_pdf_route(
     request: Request,
     file: UploadFile = File(...),
 ) -> ExtractResponse:
-    filename = file.filename or "document.pdf"
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="Empty file")
-    if len(data) > _MAX_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File exceeds {_MAX_UPLOAD_MB:g} MB upload limit",
-        )
+    settings = get_settings()
+    filename = safe_filename(file.filename)
+    data = await read_upload(
+        file,
+        settings.max_upload_bytes,
+        max_mb=settings.max_upload_mb,
+    )
 
     try:
         return await extract_document(
             data,
             filename,
             http=getattr(request.app.state, "http", None),
+            max_pages=settings.max_pages,
         )
     except EncryptedPdfError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -46,3 +46,5 @@ class EngineStatus(BaseModel):
     ocr: str = "disabled"
     groq_model: Optional[str] = None
     groq_title_verify: bool = False
+    max_upload_mb: float = 50
+    max_pages: int = 80

@@ -8,6 +8,7 @@ from typing import Optional
 
 import httpx
 
+from ..config import get_settings
 from ..schemas import ExtractResponse, HeaderItem, PageText
 from .groq_title import opening_excerpt, pick_pdf_title
 from .headings import TitleBand, headers_listed, list_headers, resolve_document_title
@@ -16,9 +17,11 @@ from .ocr import NO_OCR, run_ocr
 
 
 def _native_pass(
-    data: bytes, filename: Optional[str]
+    data: bytes,
+    filename: Optional[str],
+    max_pages: Optional[int],
 ) -> tuple[NativeDocument, str, TitleBand, list[str], str]:
-    native = extract_pdf(data)
+    native = extract_pdf(data, max_pages=max_pages)
     if not native.has_native_text:
         run_ocr(data, filename=filename)
         return native, "", TitleBand(), [], ""
@@ -33,12 +36,13 @@ async def extract_document(
     filename: Optional[str] = None,
     *,
     http: Optional[httpx.AsyncClient] = None,
+    max_pages: Optional[int] = None,
 ) -> ExtractResponse:
     started = time.perf_counter()
     elapsed = lambda: int((time.perf_counter() - started) * 1000)
 
     native, heuristic_title, band, header_texts, excerpt = await asyncio.to_thread(
-        _native_pass, data, filename
+        _native_pass, data, filename, max_pages
     )
 
     if not native.has_native_text:
@@ -61,7 +65,8 @@ async def extract_document(
         excerpt=excerpt,
     )
     if http is None:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=8.0)) as owned:
+        timeout = get_settings().groq_timeout
+        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=8.0)) as owned:
             title, title_source = await pick_pdf_title(owned, **groq_kwargs)
     else:
         title, title_source = await pick_pdf_title(http, **groq_kwargs)
