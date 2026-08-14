@@ -30,7 +30,9 @@ Without Tesseract locally, digital PDFs still work. Garbled/scanned titles fall 
 | Variable | Example |
 |---|---|
 | `ENVIRONMENT` | `production` |
-| `GROQ_API_KEY` | your Groq key |
+| `GROQ_API_KEY` | first Groq key |
+| `GROQ_API_KEY_2` | optional second key (same Qwen model; used if the first is limited) |
+| `GROQ_API_KEY_3` | optional third key |
 | `GROQ_MODEL` | `qwen/qwen3.6-27b` |
 | `GROQ_TITLE_VERIFY` | `true` |
 | `CORS_ORIGINS` | `*` for public testing; later your Next.js origin |

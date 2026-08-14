@@ -42,11 +42,32 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _groq_keys_from_env() -> tuple[str, ...]:
+    """GROQ_API_KEY, optional GROQ_API_KEYS (csv), and GROQ_API_KEY_2..8. Same Qwen model."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        for part in _csv(raw) if "," in raw else [raw.strip()]:
+            key = part.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(key)
+
+    add(os.environ.get("GROQ_API_KEY", ""))
+    add(os.environ.get("GROQ_API_KEYS", ""))
+    for index in range(2, 9):
+        add(os.environ.get(f"GROQ_API_KEY_{index}", ""))
+    return tuple(ordered)
+
+
 @dataclass(frozen=True)
 class Settings:
     environment: str
     log_level: str
     groq_api_key: str
+    groq_api_keys: tuple[str, ...]
     groq_model: str
     groq_title_verify: bool
     groq_timeout: float
@@ -72,10 +93,12 @@ class Settings:
     def from_env(cls) -> Settings:
         env = os.environ.get("ENVIRONMENT", "development").strip().lower() or "development"
         origins = _csv(os.environ.get("CORS_ORIGINS", "*"))
+        keys = _groq_keys_from_env()
         return cls(
             environment=env,
             log_level=(os.environ.get("LOG_LEVEL", "INFO").strip().upper() or "INFO"),
-            groq_api_key=os.environ.get("GROQ_API_KEY", "").strip(),
+            groq_api_key=keys[0] if keys else "",
+            groq_api_keys=keys,
             groq_model=(
                 os.environ.get("GROQ_MODEL", DEFAULT_GROQ_MODEL).strip()
                 or DEFAULT_GROQ_MODEL
@@ -96,7 +119,12 @@ def get_settings() -> Settings:
 
 
 def groq_api_key() -> str:
-    return get_settings().groq_api_key
+    keys = groq_api_keys()
+    return keys[0] if keys else ""
+
+
+def groq_api_keys() -> tuple[str, ...]:
+    return get_settings().groq_api_keys
 
 
 def groq_model() -> str:
@@ -105,4 +133,4 @@ def groq_model() -> str:
 
 def groq_enabled() -> bool:
     settings = get_settings()
-    return settings.groq_title_verify and bool(settings.groq_api_key)
+    return settings.groq_title_verify and bool(settings.groq_api_keys)

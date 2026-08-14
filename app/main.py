@@ -33,11 +33,14 @@ async def lifespan(app: FastAPI):
         limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
         headers={"User-Agent": f"ocr-v2-engine/{__version__}"},
     )
+    groq_on = settings.groq_title_verify and bool(settings.groq_api_keys)
     logger.info(
-        "engine ready version=%s env=%s groq=%s",
+        "engine ready version=%s env=%s groq=%s keys=%s model=%s",
         __version__,
         settings.environment,
-        "on" if settings.groq_title_verify and settings.groq_api_key else "off",
+        "on" if groq_on else "off",
+        len(settings.groq_api_keys) if groq_on else 0,
+        settings.groq_model if groq_on else "-",
     )
     try:
         yield

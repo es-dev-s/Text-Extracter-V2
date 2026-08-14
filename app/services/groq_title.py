@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import logging
 import re
+import time
 from typing import Iterable, Optional, Sequence
 
 import httpx
 
-from ..config import GROQ_CHAT_URL, groq_api_key, groq_enabled, groq_model
+from ..config import GROQ_CHAT_URL, groq_api_keys, groq_enabled, groq_model
 from .headings import (
     TitleBand,
     canonical_header_key,
@@ -24,6 +24,8 @@ from .headings import (
 from .native import PageExtract
 
 logger = logging.getLogger("engine.groq")
+_key_cursor = 0
+_cooldown_until: dict[str, float] = {}
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 _INDEX_PREFIX_RE = re.compile(r"^\s*\d+[.)]\s+")
@@ -304,30 +306,67 @@ def _build_messages(
     ]
 
 
+def _rotated_keys() -> list[str]:
+    """Ready keys first (round-robin). Cooling keys are last-resort, never slept on."""
+    global _key_cursor
+    keys = list(groq_api_keys())
+    if not keys:
+        return []
+    now = time.monotonic()
+    start = _key_cursor % len(keys)
+    _key_cursor += 1
+    ordered = keys[start:] + keys[:start]
+    ready = [key for key in ordered if now >= _cooldown_until.get(key, 0.0)]
+    return ready or ordered
+
+
+def _cool(key: str, seconds: float) -> None:
+    _cooldown_until[key] = time.monotonic() + max(1.0, min(seconds, 90.0))
+
+
+def _retry_after(response: httpx.Response) -> float:
+    raw = response.headers.get("retry-after") or "15"
+    try:
+        return float(raw)
+    except ValueError:
+        return 15.0
+
+
 async def _groq_content(http: httpx.AsyncClient, payload: dict) -> Optional[str]:
-    headers = {
-        "Authorization": f"Bearer {groq_api_key()}",
-        "Content-Type": "application/json",
-    }
+    keys = _rotated_keys()
+    if not keys:
+        return None
+    pool = groq_api_keys()
+    total = len(pool)
     last_status: Optional[int] = None
-    for attempt in range(2):
+    for key in keys:
+        slot = pool.index(key) + 1 if key in pool else 0
+        headers = {
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+        }
         try:
             response = await http.post(GROQ_CHAT_URL, headers=headers, json=payload)
         except httpx.TimeoutException:
-            logger.warning("Groq request timed out")
-            return None
+            logger.warning("Groq key %s/%s timed out; next key", slot, total)
+            _cool(key, 8.0)
+            continue
         except httpx.RequestError:
-            logger.warning("Groq request failed")
-            return None
+            logger.warning("Groq key %s/%s failed; next key", slot, total)
+            _cool(key, 8.0)
+            continue
         last_status = response.status_code
-        if response.status_code == 429 and attempt == 0:
-            raw = response.headers.get("retry-after") or "1.5"
-            try:
-                delay = min(max(float(raw), 0.5), 4.0)
-            except ValueError:
-                delay = 1.5
-            logger.warning("Groq rate limited; retrying in %.1fs", delay)
-            await asyncio.sleep(delay)
+        if response.status_code == 429:
+            logger.warning("Groq key %s/%s rate limited; next key", slot, total)
+            _cool(key, _retry_after(response))
+            continue
+        if response.status_code in {401, 403}:
+            logger.warning("Groq key %s/%s rejected; next key", slot, total)
+            _cool(key, 90.0)
+            continue
+        if response.status_code >= 500:
+            logger.warning("Groq key %s/%s HTTP %s; next key", slot, total, response.status_code)
+            _cool(key, 5.0)
             continue
         if response.status_code >= 400:
             logger.warning("Groq HTTP %s", response.status_code)
@@ -335,13 +374,17 @@ async def _groq_content(http: httpx.AsyncClient, payload: dict) -> Optional[str]
         try:
             body = response.json()
         except ValueError:
-            logger.warning("Groq returned non-JSON")
-            return None
-        return (
+            logger.warning("Groq key %s/%s non-JSON; next key", slot, total)
+            continue
+        content = (
             ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
             or ""
         )
-    logger.warning("Groq HTTP %s", last_status)
+        if content:
+            _cooldown_until.pop(key, None)
+            return content
+        logger.warning("Groq key %s/%s empty body; next key", slot, total)
+    logger.warning("Groq all keys failed last=%s", last_status)
     return None
 
 
