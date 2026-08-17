@@ -1,3 +1,12 @@
+# Secrets — never push keys. Keep .env.example as the template.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Local Python
 venv/
 .venv/
 __pycache__/
@@ -7,7 +16,33 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.env
-.env.local
+.coverage
+htmlcov/
+.tox/
+dist/
+build/
+
+# Sample PDFs, scans, local dumps — not part of the Engine image
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.webp
 *.log
+*.tmp
+tmp/
+.cache/
+
+# Editors / OS
 .DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cursor/
+*.swp
+*~
+
+# Local-only helpers (Railway uses Dockerfile + start.sh)
+run.sh
+Procfile
+runtime.txt

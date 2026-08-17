@@ -17,10 +17,12 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import __version__
+from .concurrency import start_pool, stop_pool
 from .config import get_settings
 from .logconfig import setup_logging
 from .middleware import MaxBodySizeMiddleware, RateLimitMiddleware, RequestContextMiddleware
 from .routers.ocr import router as ocr_router
+from .services.ocr import ocr_backend
 
 logger = logging.getLogger("engine")
 
@@ -34,17 +36,23 @@ async def lifespan(app: FastAPI):
         headers={"User-Agent": f"ocr-v2-engine/{__version__}"},
     )
     groq_on = settings.groq_title_verify and bool(settings.groq_api_keys)
+    workers, queue_timeout = start_pool()
     logger.info(
-        "engine ready version=%s env=%s groq=%s keys=%s model=%s",
+        "engine ready version=%s env=%s groq=%s keys=%s model=%s ocr=%s "
+        "extract_workers=%s queue_timeout=%.0fs",
         __version__,
         settings.environment,
         "on" if groq_on else "off",
         len(settings.groq_api_keys) if groq_on else 0,
         settings.groq_model if groq_on else "-",
+        ocr_backend(),
+        workers,
+        queue_timeout,
     )
     try:
         yield
     finally:
+        stop_pool()
         await app.state.http.aclose()
 
 
@@ -74,10 +82,11 @@ def create_app() -> FastAPI:
     # Last added runs first. CORS must wrap every JSON error so a future
     # Next.js origin can read 413/429 responses.
     application.add_middleware(GZipMiddleware, minimum_size=1000)
-    application.add_middleware(
-        RateLimitMiddleware,
-        per_minute=settings.rate_limit_per_minute,
-    )
+    if settings.rate_limit_per_minute > 0:
+        application.add_middleware(
+            RateLimitMiddleware,
+            per_minute=settings.rate_limit_per_minute,
+        )
     application.add_middleware(
         MaxBodySizeMiddleware,
         max_bytes=settings.max_upload_bytes + multipart_overhead,

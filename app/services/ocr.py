@@ -14,6 +14,7 @@ import pymupdf as fitz
 
 from .headings import (
     TitleBand,
+    is_citation_line,
     is_cover_chrome,
     is_garbled_text,
     is_journal_label,
@@ -29,6 +30,16 @@ logger = logging.getLogger("engine.ocr")
 
 NO_OCR = "No OCR"
 
+# A title never stops on these; body prose caught mid-sentence usually does.
+_SENTENCE_TAILS = frozenset(
+    """
+    and or of for the a an to with in on by from into using via at as over under
+    be is are was were been has have had do does did will would shall should can
+    could must may might that which who whom whose this these those it its they
+    them their we our you your he she his her not but so than then when while
+    """.split()
+)
+
 # Locked render settings — same PDF bytes → same pixels → same OCR text.
 RENDER_SCALE = 2.0
 TITLE_CROP_FRACTION = 0.40
@@ -42,6 +53,9 @@ class OcrTitle:
     excerpt: str = ""
     band: TitleBand = field(default_factory=TitleBand)
     jpeg: bytes = b""
+    # True when Tesseract read the page. A page read locally but holding no
+    # title is title-less, so the vision fallback need not be retried.
+    page_read: bool = False
 
 
 @lru_cache(maxsize=1)
@@ -56,6 +70,9 @@ def ocr_backend() -> str:
 def title_is_usable(text: str) -> bool:
     t = normalize(text or "")
     if not t or t.lower() in {"untitled document", "untitled", "no ocr", "no title"}:
+        return False
+    words = t.split()
+    if words and words[-1].lower().strip("-,:;") in _SENTENCE_TAILS:
         return False
     return is_plausible_title(t)
 
@@ -96,6 +113,7 @@ def recover_title(data: bytes, *, need_excerpt: bool = False) -> OcrTitle:
         try:
             png = pix.tobytes("png")
             crop_text = _tesseract_image(png)
+            result.page_read = len((crop_text or "").split()) >= 12
             result.title, result.band = _title_from_ocr(crop_text)
             if not title_is_usable(result.title):
                 result.jpeg = pix.tobytes("jpeg", jpg_quality=JPEG_QUALITY)
@@ -204,13 +222,18 @@ def _clip_excerpt(text: str, limit: int = 1000) -> str:
     return cut.strip()
 
 
+def _ends_with_wrap(text: str) -> bool:
+    words = normalize(text).split()
+    return bool(words) and words[-1].lower().strip("-,:;") in _SENTENCE_TAILS
+
+
 def _skip_ocr_line(text: str) -> bool:
     t = normalize(text)
     if not t:
         return True
     if is_known_heading(t) or is_cover_chrome(t) or is_journal_label(t):
         return True
-    if looks_like_author_line(t):
+    if looks_like_author_line(t) or is_citation_line(t):
         return True
     if "@" in t or t.lower().startswith(("copyright", "proceedings of", "issn", "doi")):
         return True
@@ -219,29 +242,54 @@ def _skip_ocr_line(text: str) -> bool:
     return False
 
 
+def _is_banner_tail(text: str, after_banner: bool) -> bool:
+    """Second line of a wrapped masthead, e.g. 'MANUFACTURING ENGINEERING'."""
+    t = normalize(text)
+    return after_banner and t.isupper() and len(t.split()) <= 4
+
+
 def _title_from_ocr(raw: str) -> tuple[str, TitleBand]:
+    """Pick the first block of OCR lines that reads like the printed title."""
+    lines = [normalize(line) for line in (raw or "").splitlines()]
+    lines = [line for line in lines if line]
     collected: list[str] = []
-    for line in (raw or "").splitlines():
-        piece = normalize(line)
-        if _skip_ocr_line(piece):
-            if collected:
-                break
+    after_banner = False
+
+    for i, text in enumerate(lines[:25]):
+        if _skip_ocr_line(text):
+            after_banner = is_cover_chrome(text) or is_journal_label(text)
             continue
-        collected.append(piece)
-        joined = " ".join(collected)
-        if title_is_usable(joined) and len(collected) >= 1 and not joined.lower().endswith(
-            (" and", " of", " for", " the", " a")
-        ):
-            if len(joined) >= 24 or len(collected) >= 2:
+        if _is_banner_tail(text, after_banner):
+            continue
+        after_banner = False
+
+        group = [text]
+        while len(group) < 3 and i + len(group) < len(lines):
+            nxt = lines[i + len(group)]
+            if _skip_ocr_line(nxt):
                 break
-        if len(collected) >= 4:
+            joined = " ".join(group)
+            incomplete = not title_is_usable(joined) or _ends_with_wrap(joined)
+            # A one- or two-word line under a complete title is its wrapped tail.
+            tail = (
+                title_is_usable(joined)
+                and len(nxt.split()) <= 3
+                and nxt[:1].isupper()
+            )
+            if not incomplete and not tail:
+                break
+            group.append(nxt)
+        joined = " ".join(group)
+        if title_is_usable(joined):
+            collected = group
             break
+
     if not collected:
         return "", TitleBand()
-    lines: list[Line] = []
+    lines_out: list[Line] = []
     y = 48.0
     for piece in collected:
-        lines.append(
+        lines_out.append(
             Line(
                 text=piece,
                 page=1,
@@ -257,7 +305,7 @@ def _title_from_ocr(raw: str) -> tuple[str, TitleBand]:
             )
         )
         y += 22.0
-    joined = join_title_lines(lines)
-    band = TitleBand(lines=lines, text=joined)
+    joined = join_title_lines(lines_out)
+    band = TitleBand(lines=lines_out, text=joined)
     title = joined if title_is_usable(joined) else ""
     return title, band

@@ -48,3 +48,5 @@ class EngineStatus(BaseModel):
     groq_title_verify: bool = False
     max_upload_mb: float = 50
     max_pages: int = 80
+    extract_workers: int = 1
+    rate_limit_per_minute: int = 0

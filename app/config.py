@@ -42,6 +42,20 @@ def _float(name: str, default: float) -> float:
         return default
 
 
+def _cpu_count() -> int:
+    """CPUs this container may actually use, not the whole host."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
+
+
+def _default_extract_workers() -> int:
+    """Heavy slots per process, so all processes together match the CPU budget."""
+    web = max(1, _int("WEB_CONCURRENCY", 1))
+    return max(2, _cpu_count() // web)
+
+
 def _groq_keys_from_env() -> tuple[str, ...]:
     """GROQ_API_KEY, optional GROQ_API_KEYS (csv), and GROQ_API_KEY_2..8. Same Qwen model."""
     ordered: list[str] = []
@@ -76,6 +90,8 @@ class Settings:
     max_pages: int
     rate_limit_per_minute: int
     docs_enabled: bool
+    extract_workers: int
+    extract_queue_timeout: float
 
     @property
     def is_production(self) -> bool:
@@ -107,9 +123,15 @@ class Settings:
             groq_timeout=max(5.0, _float("GROQ_TIMEOUT", 30.0)),
             cors_origins=origins,
             max_upload_mb=max(1.0, _float("OCR_MAX_UPLOAD_MB", 50.0)),
-            max_pages=max(1, _int("OCR_MAX_PAGES", 80)),
-            rate_limit_per_minute=max(1, _int("RATE_LIMIT_PER_MINUTE", 12)),
+            # A guard against absurd input, not a product limit: theses and
+            # books must still get a title, and page text is cheap to parse.
+            max_pages=max(1, _int("OCR_MAX_PAGES", 500)),
+            # 0 disables the limiter. The default is per IP per process, so a
+            # Next.js server proxying every upload from one IP is not throttled.
+            rate_limit_per_minute=max(0, _int("RATE_LIMIT_PER_MINUTE", 240)),
             docs_enabled=_truthy(os.environ.get("ENGINE_DOCS"), True),
+            extract_workers=max(1, _int("EXTRACT_WORKERS", _default_extract_workers())),
+            extract_queue_timeout=max(1.0, _float("EXTRACT_QUEUE_TIMEOUT", 20.0)),
         )
 
 

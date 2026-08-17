@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 
 from .. import __version__
+from ..concurrency import EngineBusyError
 from ..config import get_settings, groq_enabled, groq_model
 from ..files import read_upload, safe_filename
 from ..schemas import EngineStatus, ExtractResponse
@@ -25,6 +26,8 @@ async def engine_status() -> EngineStatus:
         ocr=ocr_backend(),
         max_upload_mb=settings.max_upload_mb,
         max_pages=settings.max_pages,
+        extract_workers=settings.extract_workers,
+        rate_limit_per_minute=settings.rate_limit_per_minute,
     )
 
 
@@ -49,6 +52,12 @@ async def extract_pdf_route(
             http=getattr(request.app.state, "http", None),
             max_pages=settings.max_pages,
         )
+    except EngineBusyError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Engine is busy. Retry shortly.",
+            headers={"Retry-After": "5"},
+        ) from exc
     except EncryptedPdfError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except NativePdfError as exc:

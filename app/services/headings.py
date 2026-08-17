@@ -25,6 +25,9 @@ VISUAL_MIN_SCORE = 1.15
 MIN_SCAN_PAGE_WORDS = 80
 MERGE_GAP_RATIO = 2.2
 TITLE_BAND_MAX_LINES = 5
+# Wrapped title lines share a font size; cover subtitles and bylines are smaller.
+WRAP_SIZE_RATIO = 0.95
+SEED_SIZE_RATIO = 0.98
 _WRAP_TAIL_WORDS = {
     "and", "or", "of", "for", "the", "a", "an", "to", "with", "in", "on",
     "by", "from", "into", "using", "via", "at", "as", "over", "under",
@@ -56,7 +59,19 @@ _JOURNAL_LABELS = {
     "technical note", "case study", "conference paper", "full length article",
     "research paper", "accepted manuscript", "conference series", "paper open access",
     "editorial board", "aims and scope", "table of contents", "you may also like",
+    "original research paper", "original research article", "original research",
+    "review paper", "research note", "regular paper", "regular article",
+    "invited review", "technical paper", "student paper", "open access",
+    "journal pre-proof", "journal preproof", "pre-proof", "preproof",
+    "uncorrected proof", "author accepted manuscript", "in press",
+    "a scitechnol journal",
 }
+_JOURNAL_LABEL_RE = re.compile(
+    r"^(?:an?\s+)?(?:original|invited|regular|full[\s-]?length|short|technical|student)?\s*"
+    r"(?:research|review|scientific|conference)?\s*"
+    r"(?:article|paper|communication|note|letter)$",
+    re.IGNORECASE,
+)
 
 _MONTHS = (
     "january", "february", "march", "april", "may", "june", "july", "august",
@@ -117,9 +132,11 @@ _NUMBERED_HEADING_RE = re.compile(
 _METADATA_LABEL_RE = re.compile(
     r"^(keywords?|corresponding author|doi|received|accepted|published|"
     r"available online(?:\s+at)?|e-?mail|pii|to appear in|received date|"
-    r"revised date|accepted date)\s*:",
+    r"revised date|accepted date|authors?|reference|references|journal|"
+    r"article history|cite this article|short title|running title)\s*:",
     re.IGNORECASE,
 )
+_LABELED_TITLE_RE = re.compile(r"^\s*title\s*:\s*(.+)$", re.IGNORECASE)
 _AUTHOR_RE = re.compile(
     r"\b(?:prof|dr|ph\.?d|engr|university|college of|corresponding author|"
     r"e-?mail|copyright|internal editor|editor-in-chief)\b",
@@ -136,9 +153,13 @@ _JOURNAL_BANNER_RE = re.compile(
 )
 _COVER_CHROME_RE = re.compile(
     r"^(?:"
-    r"a project report(?:\s+on)?"
+    r"a\s+(?:project|thesis|seminar|dissertation|technical|internship)\s+report\b.*"
+    r"|a\s+(?:thesis|dissertation|project)\s+submitted\b.*"
     r"|submitted (?:by|in|to)\b.*"
-    r"|in partial fulfillment\b.*"
+    r"|in partial fulfil?lment\b.*"
+    r"|(?:bachelors?|masters?|doctor)\s+of\s+\w+.*"
+    r"|(?:b\.?tech|m\.?tech|b\.?e\.?|m\.?e\.?|b\.?sc|m\.?sc|ph\.?d)\s+(?:in|degree)\b.*"
+    r"|award of the degree\b.*"
     r"|bachelors? of engineering\b.*"
     r"|department of .+"
     r"|associate professor\b.*"
@@ -161,7 +182,41 @@ _ADDRESS_RE = re.compile(
     r"|\b(?:layout|campus|nagar)\b)",
     re.IGNORECASE,
 )
+_CITATION_LINE_RE = re.compile(
+    r"(?:\bvol(?:ume)?\.?\s*\d+"
+    r"|\bno\.?\s*\d+\s*,"
+    r"|\bissue\s*[-:]?\s*\d+"
+    r"|\bpp\.?\s*\d+\s*[-–]\s*\d+"
+    r"|\b(?:19|20)\d{2}\s*,\s*\d+\s*\(\s*\d+\s*\)"
+    r"|\b\d{1,3}\s*\(\s*\d{1,3}\s*\)\s*\(?\s*(?:19|20)\d{2}"
+    r"|\bissn\b|\be-?issn\b|\bp-issn\b|\bdoi\b|\bimpact factor\b)",
+    re.IGNORECASE,
+)
+_ALL_PARENS_RE = re.compile(r"^\(.*\)$", re.DOTALL)
+_ABBREV_TAIL_RE = re.compile(
+    r"(?:\b[A-Z]|\b(?:No|Nos|Inc|Ltd|Co|Corp|Dept|Univ|Fig|Eq|Vol|etc|al))\.$"
+)
 _QUOTED_TITLE_RE = re.compile(r"[“\"']\s*([^“\"']{8,200}?)\s*[”\"']")
+_NON_NAME_WORDS = frozenset(
+    """
+    a an and are as at be by for from in into is of on or over the to under using via with
+    without within analysis analyses analytical application applications approach assessment
+    automobile automotive based behaviour behavior blade blades body brake casting cfd
+    characteristics comparative comparison composite composites compressor computational
+    concrete control cooling cutter cutting cycle design designing detection development
+    device diesel drive dynamic dynamics effect effects efficiency energy engine engineering
+    enhancement evaluation experimental fabrication finite flow fluid fluids friction fuel
+    gear generation harvesting heat helical hybrid hydraulic impact improvement industrial
+    investigation machine machines machining manufacturing material materials mechanical
+    mechanism method methods model modeling modelling nano nanofluid nanofluids numerical
+    optimization optimisation performance plant power pressure process processing production
+    project pump quality radiator refrigeration reliability renewable research review
+    robot rotor simulation solar steel strength structural structure study surface system
+    systems technique techniques technology temperature test testing thermal transfer
+    treatment tube tubes turbine vehicle velocity vibration water wear weld welding
+    wind work
+    """.split()
+)
 _FRONT_MATTER_MARKERS = (
     "editorial board", "table of contents", "aims and scope",
     "a journal produced by", "guide for authors",
@@ -261,20 +316,34 @@ def looks_like_author_line(text: str) -> bool:
 
 
 def _looks_like_person_name(text: str) -> bool:
-    if re.search(
-        r"\b(design|analysis|investigation|experimental|cfd|optimization|"
-        r"fabrication|study|performance|machine|engine|heat|flow|"
-        r"wind|turbine|blade|speeds?|moderate|light|portable|movable|"
-        r"mixer|cutter|planter|concrete|refrigerat|lubricant|machining)\b",
-        text,
-        re.IGNORECASE,
-    ):
-        return False
+    """Author byline without explicit markers, e.g. 'Amr M. Hassaan'.
+
+    Requires a positive name signal (an initial, an all-caps surname, or a
+    comma-separated byline). Title-case noun phrases such as 'Hybrid Nanofluid'
+    or 'Automobile Radiator Using Helical Tubes' must not match: truncating a
+    title there is far worse than letting an unmarked byline through, since the
+    wrap rules reject smaller author type anyway.
+    """
     words = [w.strip(",.;") for w in text.replace("&", " ").split() if w.strip(",.;")]
-    if not (2 <= len(words) <= 5):
+    if not (2 <= len(words) <= 6):
         return False
-    name_tok = re.compile(r"^[A-Z][a-z]+(?:[.'\-]?[A-Za-z]+)*$|^[A-Z]\.$")
-    return all(name_tok.match(w) for w in words)
+    if any(w.lower().strip(".") in _NON_NAME_WORDS for w in words):
+        return False
+    name_tok = re.compile(
+        r"^(?:[A-Z][a-z]+|[A-Z]{2,}|[A-Z])(?:[.'\-]?[A-Za-z]+)*\.?$"
+    )
+    if not all(name_tok.match(w) for w in words):
+        return False
+    initials = sum(1 for w in words if re.fullmatch(r"[A-Z]\.?", w))
+    caps_surname = sum(1 for w in words if len(w) >= 3 and w.isupper())
+    mixed_case = any(re.fullmatch(r"[A-Z][a-z]+", w) for w in words)
+    if initials:
+        return True
+    if caps_surname and mixed_case:
+        return True
+    if text.count(",") >= 1 and len(words) >= 3:
+        return True
+    return False
 
 
 def is_cover_chrome(text: str) -> bool:
@@ -334,6 +403,14 @@ def strip_title_affixes(text: str) -> str:
     if cut is not None:
         t = t[:cut].strip(" ,;:-")
     t = strip_toc_leader(t).strip(" \t-_:;,|·•“”\"'")
+    # Running headers often carry the publication year: "... MACHINE 2015".
+    stripped = _YEAR_TAIL_RE.sub("", t).strip(" ,;:-")
+    if stripped != t and len(stripped) >= 20 and _word_count(stripped) >= 4:
+        t = stripped
+    # A full stop closing a printed title is punctuation, not a sentence.
+    if t.endswith(".") and not t.endswith("..") and _word_count(t) >= 5:
+        if not _ABBREV_TAIL_RE.search(t):
+            t = t[:-1].rstrip()
     return t
 
 
@@ -351,11 +428,17 @@ def is_plausible_title(text: str) -> bool:
         return False
     if t.endswith((".", "?", "!")) and _word_count(t) >= 12:
         return False
-    if re.search(r"\.\s+[A-Z]", t) and _word_count(t) >= 10:
+    # Sentence run-on, but never trip on initialisms such as "C.I. Engine".
+    if re.search(r"[a-z]{2,}\.\s+[A-Z]", t) and _word_count(t) >= 10:
+        return False
+    if _ALL_PARENS_RE.match(t) or _CITATION_LINE_RE.search(t):
         return False
     if re.search(r"\b(?:journal of physics|open access proceedings)\b", t, re.IGNORECASE):
         return False
     if _URL_EMAIL_RE.match(t) or is_caption(t) or is_known_heading(t):
+        return False
+    # "1.1 Introduction to Harvester" is a section heading, never the title.
+    if is_numbered_heading(t) or _NUM_PREFIX_RE.match(t):
         return False
     words = [w for w in re.split(r"[\s/_\-—–|:·•]+", t) if re.search(r"[A-Za-z]", w)]
     if len(words) < 3:
@@ -382,6 +465,37 @@ def quoted_cover_title(page: PageExtract) -> Optional[str]:
         t = clean_candidate(match.group(1), allow_weak=False)
         if t and is_plausible_title(t):
             return t
+    return None
+
+
+def labeled_cover_title(page: PageExtract) -> Optional[str]:
+    """Elsevier-style preprint covers print 'Title: ...' above 'Author: ...'."""
+    lines = sorted(page.lines, key=lambda ln: (ln.y0, ln.x0))
+    for i, ln in enumerate(lines):
+        match = _LABELED_TITLE_RE.match(normalize(ln.text))
+        if not match:
+            continue
+        parts = [normalize(match.group(1))]
+        prev = ln
+        for nxt in lines[i + 1:]:
+            text = normalize(nxt.text)
+            if not text:
+                continue
+            if _METADATA_LABEL_RE.match(text) or _LABELED_TITLE_RE.match(text):
+                break
+            if nxt.size < prev.size * WRAP_SIZE_RATIO:
+                break
+            if nxt.y0 - prev.y1 > max(prev.size * 1.4, 16):
+                break
+            if looks_like_author_line(text) or is_known_heading(text):
+                break
+            parts.append(text)
+            prev = nxt
+            if len(parts) >= TITLE_BAND_MAX_LINES:
+                break
+        candidate = clean_candidate(normalize(" ".join(parts)))
+        if candidate and is_plausible_title(candidate):
+            return candidate
     return None
 
 
@@ -473,9 +587,16 @@ def is_caption(text: str) -> bool:
     return bool(_CAPTION_RE.match(normalize(text)))
 
 
+def is_citation_line(text: str) -> bool:
+    """Volume/issue/page/ISSN/DOI line printed above or below an article title."""
+    return bool(_CITATION_LINE_RE.search(normalize(text)))
+
+
 def is_journal_label(text: str) -> bool:
     key = running_header_key(text)
     if key in _JOURNAL_LABELS:
+        return True
+    if key and _JOURNAL_LABEL_RE.match(key):
         return True
     if _PAREN_LABEL_RE.match(normalize(text)):
         inner = running_header_key(text)
@@ -685,7 +806,9 @@ def _is_title_stop(ln: Line, prev: Optional[Line] = None) -> bool:
         return True
     if is_known_heading(text) or is_numbered_heading(text) or is_caption(text):
         return True
-    if is_journal_label(text):
+    if is_journal_label(text) or is_cover_chrome(text):
+        return True
+    if _CITATION_LINE_RE.search(text) or _METADATA_LABEL_RE.match(text):
         return True
     if looks_like_author_line(text):
         if prev is not None and _ends_with_wrap(prev.text) and not _strong_author_marks(text):
@@ -700,7 +823,9 @@ def _is_gap_skip(ln: Line, title_size: float, running: set[str]) -> bool:
     """Sidebar / watermark / tiny type sitting between wrapped title lines."""
     if is_font_artifact(ln) or is_garbled_text(ln.text):
         return True
-    if ln.size + 0.35 < title_size * 0.70:
+    # Anything too small to be part of this wrap is a badge ("OPEN"), not a stop.
+    # The gap ceiling in _same_wrap still prevents jumping past real content.
+    if ln.size < title_size * WRAP_SIZE_RATIO:
         return True
     text = normalize(ln.text)
     if not text or _is_rule_line(text):
@@ -718,12 +843,18 @@ def _same_wrap(prev: Line, nxt: Line, title_size: float) -> bool:
     gap = nxt.y0 - prev.y1
     if gap > max(title_size * 1.35, 16):
         return False
-    if nxt.size + 0.4 < title_size * 0.88:
+    if nxt.size < title_size * WRAP_SIZE_RATIO:
         return False
     prev_mid = (prev.x0 + prev.x1) / 2.0
     nxt_mid = (nxt.x0 + nxt.x1) / 2.0
-    aligned = abs(nxt.x0 - prev.x0) <= 48 or abs(nxt_mid - prev_mid) <= 64
-    return aligned
+    # Left, centre, right and justified blocks all wrap; the closing line of a
+    # justified title is short and sits inside the span of the line above it.
+    return (
+        abs(nxt.x0 - prev.x0) <= 48
+        or abs(nxt_mid - prev_mid) <= 64
+        or abs(nxt.x1 - prev.x1) <= 48
+        or (nxt.x0 >= prev.x0 - 8 and nxt.x1 <= prev.x1 + 8)
+    )
 
 
 def extract_title_band(
@@ -750,26 +881,55 @@ def extract_title_band(
     if not usable:
         return TitleBand(context=_title_context(ordered))
 
-    max_size = max(ln.size for ln in usable)
-    if body_size > 0 and max_size < body_size * 1.08:
-        seeds = usable
-    else:
-        seeds = [ln for ln in usable if ln.size >= max_size * 0.92]
+    # A journal masthead is often set larger than the article title, so the
+    # biggest text on the page is not always the title. Reject a masthead band
+    # and retry with the next size down.
+    rejected: set[int] = set()
+    for _ in range(4):
+        pool = [ln for ln in usable if id(ln) not in rejected]
+        if not pool:
+            break
+        band_lines = _grow_band(pool, ordered, running, rejected)
+        if not band_lines:
+            break
+        if _is_masthead_band(band_lines, ordered, running, rejected):
+            rejected.update(id(ln) for ln in band_lines)
+            continue
+        joined = strip_title_affixes(join_title_lines(band_lines))
+        return TitleBand(
+            lines=band_lines,
+            text=joined,
+            context=_title_context(ordered, skip={id(ln) for ln in band_lines}),
+        )
+    return TitleBand(context=_title_context(ordered))
+
+
+def _grow_band(
+    pool: Sequence[Line],
+    ordered: Sequence[Line],
+    running: set[str],
+    rejected: set[int],
+) -> List[Line]:
+    max_size = max(ln.size for ln in pool)
+    seeds = [ln for ln in pool if ln.size >= max_size * SEED_SIZE_RATIO]
     if not seeds:
-        seeds = usable
+        seeds = list(pool)
     seed = min(seeds, key=lambda ln: ln.y0)
     title_size = seed.size
 
     try:
         idx = ordered.index(seed)
     except ValueError:
-        return TitleBand(context=_title_context(ordered))
+        return []
+
+    def skippable(ln: Line) -> bool:
+        return id(ln) in rejected or _is_gap_skip(ln, title_size, running)
 
     band_lines = [seed]
     cursor = idx
     while len(band_lines) < TITLE_BAND_MAX_LINES:
         j = cursor - 1
-        while j >= 0 and _is_gap_skip(ordered[j], title_size, running):
+        while j >= 0 and skippable(ordered[j]):
             j -= 1
         if j < 0:
             break
@@ -784,7 +944,7 @@ def extract_title_band(
     cursor = idx
     while len(band_lines) < TITLE_BAND_MAX_LINES:
         j = cursor + 1
-        while j < len(ordered) and _is_gap_skip(ordered[j], title_size, running):
+        while j < len(ordered) and skippable(ordered[j]):
             j += 1
         if j >= len(ordered):
             break
@@ -796,12 +956,98 @@ def extract_title_band(
         band_lines.append(cand)
         cursor = j
 
-    joined = strip_title_affixes(join_title_lines(band_lines))
-    return TitleBand(
-        lines=band_lines,
-        text=joined,
-        context=_title_context(ordered, skip=set(id(ln) for ln in band_lines)),
-    )
+    return _repair_wrap_tail(band_lines, ordered, title_size, running)
+
+
+def _is_masthead_band(
+    band_lines: Sequence[Line],
+    ordered: Sequence[Line],
+    running: set[str],
+    rejected: set[int],
+) -> bool:
+    """True when the band is journal branding rather than the article title."""
+    if not band_lines:
+        return True
+    joined = normalize(join_title_lines(band_lines))
+    if not joined:
+        return True
+    if is_cover_chrome(joined) or is_journal_label(joined) or _JOURNAL_BANNER_RE.match(joined):
+        return True
+    # The band may be the tail of a masthead whose first line was filtered out.
+    size = band_lines[0].size
+    try:
+        idx = ordered.index(band_lines[0])
+    except ValueError:
+        return False
+    seen = 0
+    for j in range(idx - 1, -1, -1):
+        cand = ordered[j]
+        if id(cand) in rejected:
+            continue
+        if cand.size < size * WRAP_SIZE_RATIO:
+            continue
+        # Larger type above is a separate block. Journal papers normally print
+        # the masthead directly above the title, so only same-size text can be
+        # the banner this band belongs to.
+        if cand.size > size / WRAP_SIZE_RATIO:
+            return False
+        if band_lines[0].y0 - cand.y1 > max(size * 1.6, 20):
+            return False
+        text = normalize(cand.text)
+        if not text:
+            continue
+        # Only a publication banner marks the band below it as masthead text.
+        # Article-type labels ("Original Research Paper") sit above real titles.
+        if _JOURNAL_BANNER_RE.match(text):
+            return True
+        return False
+    return False
+
+
+def _repair_wrap_tail(
+    band_lines: List[Line],
+    ordered: Sequence[Line],
+    title_size: float,
+    running: set[str],
+) -> List[Line]:
+    """Continue a band that stopped mid-phrase, e.g. '... Radiator by Using'.
+
+    A title ending in a preposition is always truncated, so a line the stop
+    rules vetoed is more likely a misread title tail than real content. Only
+    same-size, closely-spaced lines qualify, so this cannot run into body text.
+    """
+    if not band_lines or not _ends_with_wrap(join_title_lines(band_lines)):
+        return band_lines
+    try:
+        cursor = ordered.index(band_lines[-1])
+    except ValueError:
+        return band_lines
+    for _ in range(2):
+        j = cursor + 1
+        while j < len(ordered) and _is_gap_skip(ordered[j], title_size, running):
+            j += 1
+        if j >= len(ordered):
+            break
+        cand = ordered[j]
+        prev = band_lines[-1]
+        if cand.size < title_size * WRAP_SIZE_RATIO:
+            break
+        if cand.y0 - prev.y1 > max(title_size * 1.35, 16):
+            break
+        text = normalize(cand.text)
+        if not text or is_known_heading(text) or is_caption(text):
+            break
+        if is_cover_chrome(text) or _CITATION_LINE_RE.search(text):
+            break
+        if _METADATA_LABEL_RE.match(text) or is_noise_line(cand, running):
+            break
+        if _strong_author_marks(text) or looks_like_sentence(text):
+            break
+        band_lines.append(cand)
+        cursor = j
+        if not _ends_with_wrap(join_title_lines(band_lines)):
+            break
+    return band_lines
 
 
 def _title_context(ordered: Sequence[Line], skip: Optional[set[int]] = None) -> str:
@@ -870,12 +1116,15 @@ def first_content_line(pages: Sequence[PageExtract], running: Optional[set[str]]
             if is_noise_line(ln, running) or looks_like_sentence(ln.text):
                 continue
             t = clean_candidate(ln.text)
-            if t:
+            if t and not _CITATION_LINE_RE.search(t) and not _ALL_PARENS_RE.match(t):
                 return t
         for raw in page.text.split("\n"):
             t = clean_candidate(raw)
-            if t and not looks_like_sentence(t):
-                return t
+            if not t or looks_like_sentence(t):
+                continue
+            if _CITATION_LINE_RE.search(t) or _ALL_PARENS_RE.match(t):
+                continue
+            return t
     return None
 
 
@@ -908,14 +1157,6 @@ def is_duplicate_header(
         if is_date_like(extra):
             return True
     return False
-
-
-def filename_title(filename: Optional[str]) -> Optional[str]:
-    if not filename:
-        return None
-    stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", filename)
-    stem = re.sub(r"[_\-.]+", " ", stem)
-    return clean_candidate(stem)
 
 
 def _select_scan_pages(pages: Sequence[PageExtract]) -> List[PageExtract]:
@@ -957,9 +1198,23 @@ def resolve_document_title(
     if quoted:
         return quoted, "visual", band
 
+    labeled = labeled_cover_title(scan[0]) if scan else None
+    if labeled:
+        return labeled, "visual", band
+
+    meta = clean_candidate(doc.meta_title)
+    if meta and not is_plausible_title(meta):
+        meta = None
+
     cleaned_band = strip_title_affixes(band.text) if band.text else ""
     if cleaned_band and is_plausible_title(cleaned_band):
         band.text = cleaned_band
+        # Layout can glue a header artifact onto the band; the embedded title
+        # settles it whenever the two describe the same string.
+        agreed = _reconcile_with_metadata(cleaned_band, meta)
+        if agreed != cleaned_band:
+            band.text = agreed
+            return agreed, "metadata", band
         return cleaned_band, "visual", band
 
     for page in scan:
@@ -970,15 +1225,52 @@ def resolve_document_title(
     if heading_hint and is_plausible_title(heading_hint):
         return heading_hint, "toc", band
 
-    t = clean_candidate(doc.meta_title)
-    if t and is_plausible_title(t):
-        return t, "metadata", band
+    if meta:
+        return meta, "metadata", band
+
+    # A band that merely stops mid-phrase still holds the real words; keeping it
+    # beats falling through to a journal banner, and the AI pass completes it.
+    if cleaned_band and _is_partial_title(cleaned_band):
+        band.text = cleaned_band
+        return cleaned_band, "visual", band
 
     t = first_content_line(scan or pages, running)
     if t and is_plausible_title(t):
         return t, "content", band
 
     return "Untitled document", "none", band
+
+
+def _reconcile_with_metadata(band_text: str, meta: Optional[str]) -> str:
+    """Prefer the embedded title when it is the band minus surrounding noise."""
+    if not meta:
+        return band_text
+    a = canonical_header_key(band_text)
+    b = canonical_header_key(meta)
+    if not a or not b or a == b:
+        return band_text
+    if b in a and len(b) >= max(20, len(a) * 0.5):
+        return meta
+    return band_text
+
+
+def _is_partial_title(text: str) -> bool:
+    """Real but unfinished title text: right words, cut off at a wrap point."""
+    t = normalize(text)
+    if not t or len(t) < 12 or len(t) > MAX_TITLE_LEN or is_garbled_text(t):
+        return False
+    if not t[:1].isupper():
+        return False
+    if looks_like_sentence(t) or t.endswith((".", "!", "?")):
+        return False
+    if is_cover_chrome(t) or is_journal_label(t) or looks_like_author_line(t):
+        return False
+    if _CITATION_LINE_RE.search(t) or _ALL_PARENS_RE.match(t):
+        return False
+    if "@" in t or _URL_EMAIL_RE.match(t) or is_caption(t) or is_known_heading(t):
+        return False
+    words = [w for w in re.split(r"[\s/_\-—–|:·•]+", t) if re.search(r"[A-Za-z]", w)]
+    return 3 <= len(words) <= 25
 
 
 def extract_title(

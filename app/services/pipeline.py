@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
 
+from ..concurrency import run_extraction
 from ..config import get_settings
 from ..schemas import ExtractResponse, HeaderItem, PageText
 from .groq_title import (
@@ -38,6 +38,7 @@ class _Prepared:
     excerpt: str
     method: str
     title_jpeg: bytes = field(default=b"")
+    page_read_locally: bool = False
 
 
 def _prepare(
@@ -59,8 +60,10 @@ def _prepare(
         method = "native"
 
     jpeg = b""
+    page_read_locally = False
     if needs_ocr_title(title, native, band):
         ocr = recover_title(data, need_excerpt=not excerpt_is_usable(excerpt))
+        page_read_locally = ocr.page_read
         if title_is_usable(ocr.title):
             title = ocr.title
             if ocr.band.lines:
@@ -79,6 +82,7 @@ def _prepare(
         excerpt=excerpt,
         method=method,
         title_jpeg=jpeg,
+        page_read_locally=page_read_locally,
     )
 
 
@@ -92,7 +96,7 @@ async def extract_document(
     started = time.perf_counter()
     elapsed = lambda: int((time.perf_counter() - started) * 1000)
 
-    prep = await asyncio.to_thread(_prepare, data, filename, max_pages)
+    prep = await run_extraction(_prepare, data, filename, max_pages)
     native = prep.native
 
     async def _run_title(client: httpx.AsyncClient) -> tuple[str, str]:
@@ -113,6 +117,7 @@ async def extract_document(
                 filename=filename or "document.pdf",
                 native_title=prep.title,
                 excerpt=prep.excerpt,
+                patient=not prep.page_read_locally,
             )
             if vision:
                 return vision, "groq"

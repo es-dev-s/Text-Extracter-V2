@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -30,6 +31,12 @@ _cooldown_until: dict[str, float] = {}
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 _INDEX_PREFIX_RE = re.compile(r"^\s*\d+[.)]\s+")
 EXCERPT_LIMIT = 1000
+_RUNON_SECTIONS = frozenset({
+    "abstract", "abstract:", "keywords", "keyword", "key words", "introduction",
+    "references", "bibliography", "acknowledgment", "acknowledgments",
+    "acknowledgement", "acknowledgements", "nomenclature", "contents",
+    "table of contents", "graphical abstract", "highlights",
+})
 _WRAP_TAILS = {
     "and", "or", "of", "for", "the", "a", "an", "to", "with", "in", "on",
     "by", "from", "into", "using", "via", "at", "as", "over", "under",
@@ -90,14 +97,19 @@ def _strip_index(text: str) -> str:
 
 
 def strip_section_tails(text: str) -> str:
-    """Drop trailing Abstract/Keywords/Introduction (and numbered forms) from a title."""
+    """Drop a run-on section heading, e.g. '... of a Radiator Abstract Keywords'.
+
+    Only headings that cannot end a real title qualify. Words such as
+    'Methodology' or 'Design' are section names too, but they legitimately close
+    titles like '... using Taguchi methodology', so they are left alone.
+    """
     tokens = normalize(text).split()
-    while tokens:
+    while len(tokens) > 3:
         stripped = False
-        for n in range(min(6, len(tokens)), 0, -1):
-            tail = " ".join(tokens[-n:])
-            tail_plain = re.sub(r"^\d+\.\s*", "", tail)
-            if is_known_heading(tail) or is_known_heading(tail_plain):
+        for n in range(min(3, len(tokens) - 3), 0, -1):
+            tail = " ".join(tokens[-n:]).lower().strip(" .:-")
+            tail_plain = re.sub(r"^\d+\.?\s*", "", tail)
+            if tail in _RUNON_SECTIONS or tail_plain in _RUNON_SECTIONS:
                 tokens = tokens[:-n]
                 stripped = True
                 break
@@ -199,6 +211,19 @@ def _best_plausible(text: str, pool: Sequence[str]) -> Optional[str]:
         if cleaned and is_plausible_title(cleaned):
             return cleaned
     return None
+
+
+def echoes_filename(chosen: str, filename: str) -> bool:
+    """Guard the vision path: a title must come from the page, never the filename."""
+    stem = re.sub(r"\.[A-Za-z0-9]{1,5}$", "", filename or "")
+    stem_words = _words(re.sub(r"[_\-.]+", " ", stem))
+    picked = _words(chosen)
+    if not picked or not stem_words:
+        return False
+    if picked == stem_words:
+        return True
+    overlap = len(set(picked) & set(stem_words))
+    return overlap == len(set(picked)) and len(picked) <= 6
 
 
 def grounded_in_sources(chosen: str, *sources: str) -> bool:
@@ -332,7 +357,33 @@ def _retry_after(response: httpx.Response) -> float:
         return 15.0
 
 
-async def _groq_content(http: httpx.AsyncClient, payload: dict) -> Optional[str]:
+def _shortest_cooldown() -> float:
+    """Seconds until the first key frees up, clamped so a caller never stalls."""
+    now = time.monotonic()
+    waits = [_cooldown_until.get(key, 0.0) - now for key in groq_api_keys()]
+    waits = [w for w in waits if w > 0]
+    if not waits:
+        return 1.0
+    return max(0.5, min(min(waits), 4.0))
+
+
+async def _groq_content(
+    http: httpx.AsyncClient,
+    payload: dict,
+    *,
+    attempts: int = 1,
+) -> Optional[str]:
+    """`attempts` > 1 waits out a rate limit; use it only for last-resort calls."""
+    for attempt in range(max(1, attempts)):
+        content = await _groq_attempt(http, payload)
+        if content:
+            return content
+        if attempt + 1 < attempts:
+            await asyncio.sleep(_shortest_cooldown())
+    return None
+
+
+async def _groq_attempt(http: httpx.AsyncClient, payload: dict) -> Optional[str]:
     keys = _rotated_keys()
     if not keys:
         return None
@@ -395,6 +446,7 @@ async def pick_title_from_page_image(
     filename: str,
     native_title: str = "",
     excerpt: str = "",
+    patient: bool = True,
 ) -> Optional[str]:
     """Read the printed title from a small page-1 JPEG. Used only when text OCR failed."""
     if not jpeg or not groq_enabled() or len(jpeg) > 900_000:
@@ -439,12 +491,15 @@ async def pick_title_from_page_image(
         "reasoning_effort": "none",
         "response_format": {"type": "json_object"},
     }
-    content = await _groq_content(http, payload)
+    # Worth waiting out a rate limit only when nothing else can read the page.
+    content = await _groq_content(http, payload, attempts=3 if patient else 1)
     if not content:
         return None
     data = _parse_json_object(content) or {}
     chosen = freeze_title(str(data.get("title") or ""))
     if not chosen or not is_plausible_title(chosen):
+        return None
+    if echoes_filename(chosen, filename):
         return None
     return chosen
 
@@ -459,7 +514,9 @@ async def pick_pdf_title(
     excerpt: str = "",
 ) -> tuple[str, str]:
     header_list = [_strip_index(h) for h in (headers or []) if h]
-    fallback = freeze_title(band.text or heuristic_title)
+    # The resolver already weighed the band against metadata, TOC and layout,
+    # so its answer wins; the band is only a candidate source from here on.
+    fallback = freeze_title(heuristic_title or band.text)
     pool = _candidate_pool(band, header_list)
     locked = _best_plausible(fallback, pool) or fallback
     sources = (
