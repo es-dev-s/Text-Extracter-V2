@@ -77,13 +77,29 @@ def title_is_usable(text: str) -> bool:
     return is_plausible_title(t)
 
 
-def needs_ocr_title(title: str, native: NativeDocument, band: TitleBand) -> bool:
-    """OCR only when layout text cannot yield a real title. Good PDFs skip this."""
+def native_text_is_readable(native: NativeDocument, band: TitleBand | None = None) -> bool:
+    """True when the PDF has a usable text layer. A weak title is not a scan."""
     if not native.has_native_text:
-        return True
-    if band.text and is_garbled_text(band.text):
-        return True
-    return not title_is_usable(title)
+        return False
+    if band and band.text and is_garbled_text(band.text):
+        return False
+    sample = ""
+    if native.pages:
+        sample = (native.pages[0].text or "")[:180]
+    if not sample:
+        sample = (native.content or "")[:180]
+    if sample and is_garbled_text(sample):
+        return False
+    return True
+
+
+def needs_ocr_title(native: NativeDocument, band: TitleBand) -> bool:
+    """Rasterize page 1 only when embedded text is missing or unreadable.
+
+    Layout failing to pick a title is not a scan: Groq text still has the
+    excerpt. CID dumps look native but are not readable, so those still OCR.
+    """
+    return not native_text_is_readable(native, band)
 
 
 def excerpt_is_usable(text: str) -> bool:

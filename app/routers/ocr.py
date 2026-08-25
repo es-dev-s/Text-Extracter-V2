@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 
 from .. import __version__
 from ..concurrency import EngineBusyError
@@ -36,6 +36,7 @@ async def engine_status() -> EngineStatus:
 async def extract_pdf_route(
     request: Request,
     file: UploadFile = File(...),
+    title_only: bool = Query(False),
 ) -> ExtractResponse:
     settings = get_settings()
     filename = safe_filename(file.filename)
@@ -51,6 +52,7 @@ async def extract_pdf_route(
             filename,
             http=getattr(request.app.state, "http", None),
             max_pages=settings.max_pages,
+            title_only=title_only,
         )
     except EngineBusyError as exc:
         raise HTTPException(
