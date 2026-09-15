@@ -16,9 +16,14 @@ from ..config import GROQ_CHAT_URL, groq_api_keys, groq_enabled, groq_model
 from .headings import (
     TitleBand,
     canonical_header_key,
+    is_cover_chrome,
+    is_journal_label,
     is_known_heading,
+    is_numbered_heading,
     is_plausible_title,
     join_title_lines,
+    looks_like_author_line,
+    looks_like_sentence,
     normalize,
     strip_title_affixes,
 )
@@ -44,20 +49,26 @@ _WRAP_TAILS = {
 
 
 def opening_excerpt(pages: Sequence[PageExtract], limit: int = EXCERPT_LIMIT) -> str:
-    """Up to `limit` characters: page 1, then 2, then 3, until the budget is filled."""
+    """Opening text from the first few pages so a delayed title is still visible."""
+    take = [p for p in pages[:4] if (p.text or "").strip()]
+    if not take:
+        return ""
+    budget = max(240, limit // len(take))
     parts: list[str] = []
-    for page in pages:
+    for page in take:
         text = re.sub(r"\s+", " ", page.text or "").strip()
-        if not text:
-            continue
-        parts.append(text)
-        if len(" ".join(parts)) >= limit:
-            break
+        if len(text) > budget:
+            cut = text[:budget]
+            if text[budget:budget + 1].isalnum() and cut[-1:].isalnum():
+                cut = cut.rsplit(" ", 1)[0]
+            text = cut.strip()
+        if text:
+            parts.append(text)
     blob = " ".join(parts).strip()
     if len(blob) <= limit:
         return blob
     cut = blob[:limit]
-    if blob[limit].isalnum() and cut[-1:].isalnum():
+    if len(blob) > limit and blob[limit].isalnum() and cut[-1:].isalnum():
         cut = cut.rsplit(" ", 1)[0]
     return cut.strip()
 
@@ -148,9 +159,19 @@ def _candidate_pool(
     pool: list[str] = []
     seen: set[str] = set()
 
-    def add(text: str) -> None:
+    def add(text: str, *, allow_partial: bool = False) -> None:
         t = strip_title_affixes(strip_section_tails(_strip_index(text)))
-        if not t or is_known_heading(t) or not is_plausible_title(t):
+        if not t or is_known_heading(t) or is_numbered_heading(t):
+            return
+        words = t.split()
+        last = words[-1].lower().strip("-,:") if words else ""
+        wrap_tail = last in _WRAP_TAILS
+        if not is_plausible_title(t):
+            if not (allow_partial and wrap_tail and len(words) >= 3):
+                return
+        if looks_like_author_line(t) or is_cover_chrome(t) or is_journal_label(t):
+            return
+        if looks_like_sentence(t) and not allow_partial:
             return
         key = canonical_header_key(t)
         if not key or key in seen:
@@ -158,13 +179,18 @@ def _candidate_pool(
         seen.add(key)
         pool.append(t)
 
+    for item in band.candidates:
+        add(item, allow_partial=True)
     if band.text:
-        add(band.text)
+        add(band.text, allow_partial=True)
     if band.lines:
         for i in range(len(band.lines)):
             for j in range(i, len(band.lines)):
-                add(join_title_lines(band.lines[i : j + 1]))
-    for item in headers:
+                add(join_title_lines(band.lines[i : j + 1]), allow_partial=True)
+    for item in headers[:12]:
+        t = _strip_index(item)
+        if is_known_heading(t) or is_numbered_heading(t) or looks_like_author_line(t):
+            continue
         add(item)
     return pool
 
@@ -193,6 +219,17 @@ def complete_from_list(chosen: str, pool: Sequence[str]) -> Optional[str]:
 
 
 def _best_plausible(text: str, pool: Sequence[str]) -> Optional[str]:
+    cleaned = freeze_title(text)
+    if cleaned and is_plausible_title(cleaned) and not looks_like_sentence(cleaned):
+        longer = complete_from_list(cleaned, pool)
+        if (
+            longer
+            and is_plausible_title(longer)
+            and not looks_like_sentence(longer)
+            and len(canonical_header_key(longer)) <= len(canonical_header_key(cleaned)) + 48
+        ):
+            return freeze_title(longer)
+        return cleaned
     ordered: list[str] = []
     longer = complete_from_list(text, pool)
     if longer:
@@ -227,18 +264,26 @@ def echoes_filename(chosen: str, filename: str) -> bool:
 
 
 def grounded_in_sources(chosen: str, *sources: str) -> bool:
-    allowed = _words(" ".join(s for s in sources if s))
-    picked = _words(chosen)
-    if not picked or not allowed:
+    blob = " ".join(s for s in sources if s)
+    if not chosen or not blob:
         return False
-    counts: dict[str, int] = {}
-    for word in allowed:
-        counts[word] = counts.get(word, 0) + 1
-    for word in picked:
-        if counts.get(word, 0) <= 0:
-            return False
-        counts[word] -= 1
-    return True
+    if recover_span(chosen, blob):
+        return True
+    key = canonical_header_key(chosen)
+    return bool(key) and key in canonical_header_key(blob)
+
+
+def _pool_match(chosen: str, pool: Sequence[str]) -> Optional[str]:
+    completed = complete_from_list(chosen, pool)
+    if completed:
+        return freeze_title(completed)
+    key = canonical_header_key(freeze_title(chosen))
+    if not key:
+        return None
+    for cand in pool:
+        if canonical_header_key(cand) == key:
+            return freeze_title(cand)
+    return None
 
 
 def _accept_ai_title(
@@ -246,8 +291,10 @@ def _accept_ai_title(
     chosen: str,
     pool: Sequence[str],
     sources: Sequence[str],
+    *,
+    uncertain: bool = False,
 ) -> Optional[str]:
-    """Keep native when it is already complete; allow AI only to confirm or fill a half title."""
+    """Accept AI when it names a listed candidate or a contiguous page span."""
     native_f = freeze_title(native)
     chosen_f = freeze_title(chosen)
     if not chosen_f:
@@ -259,25 +306,39 @@ def _accept_ai_title(
         if found:
             recovered = found
             break
-    completed = freeze_title(complete_from_list(recovered, pool) or recovered)
+
+    completed = _pool_match(recovered, pool) or _pool_match(chosen_f, pool)
+    if not completed:
+        span = freeze_title(recovered)
+        if span and is_plausible_title(span) and grounded_in_sources(span, *sources):
+            completed = span
+        else:
+            return None
     if not completed or not is_plausible_title(completed):
         return None
-    if not grounded_in_sources(completed, *sources):
+    if looks_like_author_line(completed) or is_cover_chrome(completed) or is_journal_label(completed):
+        return None
+    if pool and not _pool_match(completed, pool) and not grounded_in_sources(completed, *sources):
         return None
 
     native_key = canonical_header_key(native_f)
     chosen_key = canonical_header_key(completed)
     native_incomplete = _is_incomplete_title(native_f)
+    native_weak = (
+        uncertain
+        or native_incomplete
+        or not is_plausible_title(native_f)
+        or looks_like_author_line(native_f)
+        or looks_like_sentence(native_f)
+    )
 
-    if not native_incomplete and is_plausible_title(native_f):
+    if not native_weak:
         if chosen_key == native_key:
             return native_f
         if native_key and chosen_key.startswith(native_key + " "):
             return completed
         return None
 
-    if native_key and (chosen_key == native_key or chosen_key.startswith(native_key + " ")):
-        return completed
     return completed
 
 
@@ -288,44 +349,44 @@ def _build_messages(
     band: TitleBand,
     headers: Sequence[str],
     excerpt: str,
+    pool: Sequence[str],
 ) -> list[dict]:
+    listed = "\n".join(
+        f"{i}. {item}" for i, item in enumerate(pool, start=1)
+    ) or "(none)"
     band_lines = "\n".join(
         f"{i}. {normalize(ln.text)}" for i, ln in enumerate(band.lines, start=1)
     ) or "(none)"
-    listed = "\n".join(
-        f"{i}. {_strip_index(h)}" for i, h in enumerate(headers, start=1)
-    ) or "(none)"
+    heading_hints = []
+    for item in headers[:12]:
+        t = _strip_index(item)
+        if t and not is_known_heading(t) and not is_numbered_heading(t):
+            heading_hints.append(t)
+    headings = "\n".join(f"- {item}" for item in heading_hints) or "(none)"
     return [
         {
             "role": "system",
             "content": (
-                "You verify the official printed title of an engineering assignment "
-                "or CDR (Competency Demonstration Report) PDF. "
-                "The native title is a layout validation already extracted from the PDF. "
-                "The text block is up to 1000 characters copied from the PDF "
-                "(page 1, then page 2, then page 3, until 1000 characters). "
-                "Return the complete title exactly as printed. "
-                "If the native title is already the full printed title, copy it EXACTLY "
-                "— same words and spelling; do not shorten or replace it. "
-                "If the native title is half (cuts off, ends with and/of/for/the, or is "
-                "cover chrome such as Accepted Manuscript), complete or correct it using "
-                "ONLY words that appear in the native title, title-band, header list, or "
-                "the text block. Never invent words. Never add authors, emails, URLs, "
-                "journal names, university names, campus addresses, Abstract, Keywords, "
-                "Introduction, or References. JSON only."
+                "Extract the official printed document title from the top of the article page. "
+                "If NATIVE TITLE is already that full printed title, return it. "
+                "Prefer a numbered candidate when it matches the printed title exactly. "
+                "If the native title is authors, a journal name, or truncated, copy the "
+                "printed title from the title-band lines. "
+                "Never return Abstract, Keywords, article-info, or body sentences. "
+                "Never invent words. Never concatenate unrelated fragments. JSON only."
             ),
         },
         {
             "role": "user",
             "content": (
                 f"Filename: {filename}\n\n"
-                f"NATIVE TITLE (layout validation I found):\n{heuristic_title}\n\n"
-                f"Detected headers / title list:\n{listed}\n\n"
-                f"Title-band lines (large text at the top):\n{band_lines}\n\n"
-                f"TEXT BLOCK (up to 1000 characters from the PDF, page 1 then 2 then 3…):\n"
-                f"{excerpt}\n\n"
+                f"NATIVE TITLE (layout guess, may be wrong):\n{heuristic_title}\n\n"
+                f"CANDIDATES (hints, not a closed list):\n{listed}\n\n"
+                f"Title-band lines:\n{band_lines}\n\n"
+                f"Other headings:\n{headings}\n\n"
+                f"Opening page text:\n{excerpt}\n\n"
                 "Return JSON: "
-                '{"title": "<full exact printed title>"}'
+                '{"index": <1-based candidate number or null>, "title": "<exact printed title>"}'
             ),
         },
     ]
@@ -420,7 +481,12 @@ async def _groq_attempt(http: httpx.AsyncClient, payload: dict) -> Optional[str]
             _cool(key, 5.0)
             continue
         if response.status_code >= 400:
-            logger.warning("Groq HTTP %s", response.status_code)
+            logger.warning(
+                "Groq HTTP %s model=%s body=%s",
+                response.status_code,
+                payload.get("model"),
+                (response.text or "")[:240],
+            )
             return None
         try:
             body = response.json()
@@ -447,16 +513,19 @@ async def pick_title_from_page_image(
     native_title: str = "",
     excerpt: str = "",
     patient: bool = True,
+    candidates: Sequence[str] | None = None,
 ) -> Optional[str]:
     """Read the printed title from a small page-1 JPEG. Used only when text OCR failed."""
     if not jpeg or not groq_enabled() or len(jpeg) > 900_000:
         return None
+    pool = [c for c in (candidates or []) if c]
     data_url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode("ascii")
     safe_excerpt = re.sub(r"[^\x20-\x7E]+", " ", excerpt or "")
     safe_excerpt = re.sub(r"\s+", " ", safe_excerpt).strip()[:400]
     native_guess = native_title if native_title and native_title.lower() not in {
         "untitled document", "untitled", "no ocr",
     } else "(none)"
+    listed = "\n".join(f"{i}. {item}" for i, item in enumerate(pool, start=1)) or "(none)"
     payload = {
         "model": groq_model(),
         "messages": [
@@ -464,8 +533,9 @@ async def pick_title_from_page_image(
                 "role": "system",
                 "content": (
                     "Read the official printed document title from the top of this first page. "
-                    "Return that title exactly as printed. Do not add authors, emails, journal "
-                    "names, Abstract, or Keywords. JSON only."
+                    "Prefer a listed candidate when it matches the printed title. "
+                    "If the list is wrong, copy the printed title from the page. "
+                    "Do not add authors, emails, journal names, Abstract, or Keywords. JSON only."
                 ),
             },
             {
@@ -476,8 +546,9 @@ async def pick_title_from_page_image(
                         "text": (
                             f"Filename: {filename}\n"
                             f"Native title guess (may be wrong): {native_guess}\n"
+                            f"Candidates:\n{listed}\n"
                             f"Opening text (may be garbled): {safe_excerpt or '(none)'}\n"
-                            'Return JSON: {"title": "<full exact printed title>"}'
+                            'Return JSON: {"index": <number or null>, "title": "<full exact printed title>"}'
                         ),
                     },
                     {"type": "image_url", "image_url": {"url": data_url}},
@@ -497,7 +568,24 @@ async def pick_title_from_page_image(
         return None
     data = _parse_json_object(content) or {}
     chosen = freeze_title(str(data.get("title") or ""))
+    if not chosen:
+        try:
+            idx = int(data.get("index"))
+            if pool and 1 <= idx <= len(pool):
+                chosen = freeze_title(pool[idx - 1])
+        except (TypeError, ValueError):
+            chosen = ""
+    if pool:
+        matched = _pool_match(chosen, pool)
+        if matched:
+            chosen = matched
+        else:
+            span = recover_span(chosen, " ".join([*pool, safe_excerpt, native_guess]))
+            if span:
+                chosen = freeze_title(span)
     if not chosen or not is_plausible_title(chosen):
+        return None
+    if looks_like_author_line(chosen) or is_cover_chrome(chosen) or is_journal_label(chosen):
         return None
     if echoes_filename(chosen, filename):
         return None
@@ -514,19 +602,25 @@ async def pick_pdf_title(
     excerpt: str = "",
 ) -> tuple[str, str]:
     header_list = [_strip_index(h) for h in (headers or []) if h]
-    # The resolver already weighed the band against metadata, TOC and layout,
-    # so its answer wins; the band is only a candidate source from here on.
     fallback = freeze_title(heuristic_title or band.text)
     pool = _candidate_pool(band, header_list)
     locked = _best_plausible(fallback, pool) or fallback
     sources = (
         excerpt,
-        " ".join(header_list),
+        " ".join(pool),
         join_title_lines(band.lines) if band.lines else "",
         fallback,
+        band.context,
+    )
+    uncertain = bool(band.uncertain) or _is_incomplete_title(locked)
+    confident = (
+        is_plausible_title(locked)
+        and not uncertain
+        and not looks_like_author_line(locked)
+        and not looks_like_sentence(locked)
     )
 
-    if not groq_enabled():
+    if not groq_enabled() or confident:
         return locked, "heuristic"
 
     payload = {
@@ -537,6 +631,7 @@ async def pick_pdf_title(
             band=band,
             headers=header_list,
             excerpt=excerpt,
+            pool=pool,
         ),
         "temperature": 0.0,
         "top_p": 1e-9,
@@ -552,6 +647,13 @@ async def pick_pdf_title(
     data = _parse_json_object(content) or {}
     chosen = freeze_title(str(data.get("title") or ""))
     if not chosen:
+        try:
+            idx = int(data.get("index"))
+            if pool and 1 <= idx <= len(pool):
+                chosen = freeze_title(pool[idx - 1])
+        except (TypeError, ValueError):
+            chosen = ""
+    if not chosen:
         start, end = data.get("start"), data.get("end")
         try:
             start_i, end_i = int(start), int(end)
@@ -560,7 +662,9 @@ async def pick_pdf_title(
         except (TypeError, ValueError):
             chosen = ""
 
-    accepted = _accept_ai_title(locked, chosen, pool, sources) if chosen else None
+    accepted = _accept_ai_title(
+        locked, chosen, pool, sources, uncertain=uncertain,
+    ) if chosen else None
     if accepted:
         return accepted, "groq"
     return locked, "heuristic"

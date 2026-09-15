@@ -90,6 +90,32 @@ def _span_italic(span: dict) -> bool:
     return bool(flags & ITALIC_FLAG) or ("italic" in font) or ("oblique" in font)
 
 
+def _join_fragment_texts(parts: Sequence[str]) -> str:
+    """Join word-level PDF fragments without inventing punctuation."""
+    out = ""
+    for raw in parts:
+        piece = str(raw or "")
+        if not piece:
+            continue
+        if not out:
+            out = piece
+            continue
+        if out.endswith("-") and piece[:1].islower():
+            out = out[:-1] + piece
+            continue
+        if out[-1].isspace() or piece[0].isspace():
+            out = out.rstrip() + " " + piece.lstrip()
+            continue
+        if piece[0] in ",.;:!?)]}%":
+            out += piece
+            continue
+        if out[-1] in "([/":
+            out += piece
+            continue
+        out += " " + piece
+    return out.strip()
+
+
 def _line_from_spans(
     spans: Sequence[dict],
     page_no: int,
@@ -143,6 +169,69 @@ def _line_from_spans(
     )
 
 
+def _same_baseline(a: Line, b: Line) -> bool:
+    ay = (a.y0 + a.y1) / 2.0
+    by = (b.y0 + b.y1) / 2.0
+    size = min(a.size or 8.0, b.size or 8.0, 14.0)
+    return abs(ay - by) <= max(2.4, size * 0.42)
+
+
+def _column_gap_lines(prev: Line, nxt: Line) -> bool:
+    gap = nxt.x0 - prev.x1
+    if gap <= 0:
+        return False
+    size = max(prev.size, nxt.size, 8.0)
+    width = prev.page_width or nxt.page_width or 0.0
+    return gap >= max(36.0, width * 0.08, size * 4.0)
+
+
+def _merge_line_group(group: Sequence[Line]) -> Line:
+    items = sorted(group, key=lambda ln: ln.x0)
+    scored: List[Tuple[int, Line]] = []
+    for ln in items:
+        scored.append((max(len((ln.text or "").strip()), 1), ln))
+    _w, style = max(scored, key=lambda row: (row[0], row[1].size))
+    return Line(
+        text=_join_fragment_texts([ln.text for ln in items]),
+        page=style.page,
+        size=style.size,
+        bold=style.bold,
+        italic=style.italic,
+        x0=min(ln.x0 for ln in items),
+        y0=min(ln.y0 for ln in items),
+        x1=max(ln.x1 for ln in items),
+        y1=max(ln.y1 for ln in items),
+        page_width=style.page_width,
+        page_height=style.page_height,
+        font=style.font,
+    )
+
+
+def _merge_reading_lines(lines: Sequence[Line]) -> List[Line]:
+    """Rebuild print lines when PyMuPDF emits one word per line."""
+    if len(lines) <= 1:
+        return list(lines)
+    ordered = sorted(lines, key=lambda ln: (ln.y0, ln.x0))
+    rows: List[List[Line]] = [[ordered[0]]]
+    for ln in ordered[1:]:
+        if any(_same_baseline(prev, ln) for prev in rows[-1]):
+            rows[-1].append(ln)
+        else:
+            rows.append([ln])
+    merged: List[Line] = []
+    for row in rows:
+        row.sort(key=lambda ln: ln.x0)
+        segments: List[List[Line]] = [[row[0]]]
+        for ln in row[1:]:
+            if _column_gap_lines(segments[-1][-1], ln):
+                segments.append([ln])
+            else:
+                segments[-1].append(ln)
+        for segment in segments:
+            merged.append(segment[0] if len(segment) == 1 else _merge_line_group(segment))
+    return merged
+
+
 def _extract_page(page, page_no: int) -> PageExtract:
     rect = page.rect
     width, height = float(rect.width), float(rect.height)
@@ -151,6 +240,11 @@ def _extract_page(page, page_no: int) -> PageExtract:
         try:
             plain = tp.extractText(sort=True) or ""
             data = tp.extractDICT(sort=True) or {}
+            print("\n" + "=" * 80)
+            print(f"PYMUPDF RAW TEXT - PAGE {page_no}")
+            print("=" * 80)
+            print(plain)
+
         except TypeError:
             plain = tp.extractText() or ""
             data = tp.extractDICT() or {}
@@ -173,9 +267,30 @@ def _extract_page(page, page_no: int) -> PageExtract:
             if parsed is not None:
                 lines.append(parsed)
 
+    lines = _merge_reading_lines(lines)
     reconstructed = "\n".join(ln.text for ln in lines)
-    # Prefer the longer extract so clipped/hidden spans are not dropped.
-    text = plain.strip() if len(plain.strip()) >= len(reconstructed.strip()) else reconstructed
+    print("\n" + "=" * 80)
+    print(f"RECONSTRUCTED LINES - PAGE {page_no}")
+    print("=" * 80)
+
+    for i, ln in enumerate(lines):
+        print(
+            f"[{i}] text={ln.text!r} "
+            f"size={ln.size} "
+            f"bold={ln.bold} "
+            f"font={ln.font!r} "
+            f"bbox=({ln.x0:.1f}, {ln.y0:.1f}, {ln.x1:.1f}, {ln.y1:.1f})"
+        )
+
+    print("=" * 80)
+    avg_words = (
+        sum(len(ln.text.split()) for ln in lines) / len(lines)
+        if lines else 0.0
+    )
+    if avg_words >= 3 and reconstructed.strip():
+        text = reconstructed.strip()
+    else:
+        text = plain.strip() if len(plain.strip()) >= len(reconstructed.strip()) else reconstructed
     char_count = len(text.strip())
     digital = char_count >= DIGITAL_TEXT_MIN_CHARS
     return PageExtract(

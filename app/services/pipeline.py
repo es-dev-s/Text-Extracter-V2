@@ -125,12 +125,13 @@ def _prepare(
 
     jpeg = b""
     page_read_locally = False
+    native_title_was_usable = title_is_usable(title)
     if needs_ocr_title(native, band):
         started = time.perf_counter()
         ocr = recover_title(data, need_excerpt=not excerpt_is_usable(excerpt))
         timings["ocr"] = _ms(started)
         page_read_locally = ocr.page_read
-        if title_is_usable(ocr.title):
+        if title_is_usable(ocr.title) and not native_title_was_usable:
             title = ocr.title
             if ocr.band.lines:
                 band = ocr.band
@@ -233,15 +234,17 @@ async def extract_document(
                 return title, source
         else:
             _log_step(name, "groq_text", skipped="no_readable_text")
+            title, source = prep.title, "heuristic"
         if prep.title_jpeg:
             groq_started = time.perf_counter()
             vision = await pick_title_from_page_image(
                 client,
                 jpeg=prep.title_jpeg,
                 filename=filename or "document.pdf",
-                native_title=prep.title,
+                native_title=title or prep.title,
                 excerpt=prep.excerpt,
                 patient=not prep.page_read_locally,
+                candidates=prep.band.candidates or ([title] if title else []),
             )
             groq_ms = _ms(groq_started)
             prep.timings["groq_vision"] = groq_ms
@@ -250,13 +253,13 @@ async def extract_document(
                 "groq_vision",
                 groq_ms,
                 found=bool(vision),
-                title=vision or prep.title,
+                title=vision or title or prep.title,
             )
             if vision:
                 return vision, "groq"
         else:
             _log_step(name, "groq_vision", skipped="no_page_image")
-        return prep.title, "heuristic"
+        return title or prep.title, source if has_text else "heuristic"
 
     title = prep.title
     title_source = "visual"
